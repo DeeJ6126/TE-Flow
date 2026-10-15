@@ -1,0 +1,174 @@
+"""Accession → iSeq paired FASTQ → fastp → STAR → TEcount → merged.count.
+
+Run with --directory JOB_DIR --configfile JOB_DIR/config.yaml.  Reference files
+are supplied by the existing project; this workflow never builds an index.
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = str(Path(workflow.basedir) / "scripts")
+sys.path.insert(0, SCRIPT_DIR)
+from prepare_samples import normalize_accession, RUN_PATTERN
+
+ACCESSION = normalize_accession(config["ACCESSION"])
+SAMPLES_DIR = str(Path(config["SAMPLES_DIR"]).expanduser().resolve())
+OUTPUT_DIR = str(Path(config["OUTPUT_DIR"]).expanduser().resolve())
+THREADS = int(config.get("THREADS", 10))
+if THREADS < 1:
+    raise ValueError("THREADS 必须大于零。")
+
+INDEX_PREFIX = str(Path(config["INDEX_PREFIX"]).expanduser().resolve())
+GENOME_ANNOTATION = str(Path(config["GENOME_ANNOTATION"]).expanduser().resolve())
+TE_ANNOTATION = str(Path(config["TE_ANNOTATION"]).expanduser().resolve())
+INDEX_FILES = [os.path.join(INDEX_PREFIX, name) for name in
+               ("Genome", "SA", "SAindex", "genomeParameters.txt")]
+for reference in INDEX_FILES + [GENOME_ANNOTATION, TE_ANNOTATION]:
+    if not Path(reference).is_file() or Path(reference).stat().st_size == 0:
+        raise ValueError(f"参考文件缺失或为空: {reference}")
+
+MANIFEST = os.path.join(OUTPUT_DIR, "samples.json")
+GEO = ACCESSION.startswith("GSE")
+RUN_ROOT = os.path.join(OUTPUT_DIR, "{sample}") if GEO else OUTPUT_DIR
+QC_DIR = os.path.join(RUN_ROOT, "qc")
+ALIGN_DIR = os.path.join(RUN_ROOT, "align")
+ABUNDANCE_DIR = os.path.join(RUN_ROOT, "abundance")
+LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
+
+
+def samples_manifest(wildcards):
+    completed = checkpoints.prepare_samples.get()
+    with open(completed.output[0], encoding="utf-8") as handle:
+        document = json.load(handle)
+    if document.get("accession") != ACCESSION or not document.get("samples"):
+        raise ValueError("样本清单编号不一致或为空，请重新执行下载步骤。")
+    return document
+
+
+def raw_pair(wildcards, mate):
+    samples = samples_manifest(wildcards)["samples"]
+    if wildcards.sample not in samples:
+        raise ValueError(f"样本清单中没有 {wildcards.sample}。")
+    return samples[wildcards.sample][mate]
+
+
+def count_tables(wildcards):
+    samples = samples_manifest(wildcards)["samples"]
+    return [os.path.join(ABUNDANCE_DIR.format(sample=run), f"{run}.cntTable") for run in samples]
+
+
+rule all:
+    input:
+        (os.path.join(ABUNDANCE_DIR, f"{ACCESSION}.cntTable") if RUN_PATTERN.fullmatch(ACCESSION)
+         else os.path.join(OUTPUT_DIR, "merged.count"))
+
+
+checkpoint prepare_samples:
+    output:
+        MANIFEST
+    params:
+        accession=ACCESSION,
+        samples_dir=SAMPLES_DIR,
+        output_dir=OUTPUT_DIR,
+        iseq_bin=config.get("ISEQ_BIN", "iseq"),
+        retries=int(config.get("DOWNLOAD_RETRIES", 3)),
+        metadata_timeout=int(config.get("METADATA_TIMEOUT", 180)),
+        output_space_multiplier=float(config.get("OUTPUT_SPACE_MULTIPLIER", 4))
+    threads:
+        min(THREADS, 8)
+    resources:
+        download_slots=1,
+        mem_mb=2000
+    log:
+        os.path.join(LOG_DIR, "prepare_samples.log")
+    script:
+        "scripts/prepare_samples.py"
+
+
+rule quality_control:
+    input:
+        R1_raw=lambda wildcards: raw_pair(wildcards, "r1"),
+        R2_raw=lambda wildcards: raw_pair(wildcards, "r2")
+    output:
+        R1_clean=os.path.join(QC_DIR, "{sample}_clean_R1.fq.gz"),
+        R2_clean=os.path.join(QC_DIR, "{sample}_clean_R2.fq.gz"),
+        html=os.path.join(QC_DIR, "{sample}.html"),
+        json=os.path.join(QC_DIR, "{sample}.json")
+    threads:
+        min(THREADS, 16)
+    resources:
+        mem_mb=4000
+    log:
+        os.path.join(LOG_DIR, "{sample}.fastp.log")
+    shell:
+        "fastp -w {threads} -h {output.html:q} -j {output.json:q} "
+        "-i {input.R1_raw:q} -I {input.R2_raw:q} "
+        "-o {output.R1_clean:q} -O {output.R2_clean:q} > {log:q} 2>&1"
+
+
+rule star_align:
+    input:
+        R1=os.path.join(QC_DIR, "{sample}_clean_R1.fq.gz"),
+        R2=os.path.join(QC_DIR, "{sample}_clean_R2.fq.gz"),
+        index=INDEX_FILES
+    output:
+        bam=os.path.join(ALIGN_DIR, "{sample}Aligned.sortedByCoord.out.bam")
+    params:
+        genome=INDEX_PREFIX,
+        prefix=lambda wildcards: os.path.join(ALIGN_DIR.format(sample=wildcards.sample), wildcards.sample)
+    threads:
+        THREADS
+    resources:
+        star_slots=1,
+        mem_mb=int(config.get("STAR_MEM_MB", 200000))
+    log:
+        os.path.join(LOG_DIR, "{sample}.STAR.log")
+    shell:
+        "STAR --genomeDir {params.genome:q} --runThreadN {threads} "
+        "--readFilesIn {input.R1:q} {input.R2:q} --readFilesCommand zcat "
+        "--outFileNamePrefix {params.prefix:q} "
+        "--outFilterMultimapNmax 100 --winAnchorMultimapNmax 100 "
+        "--outMultimapperOrder Random --outSAMmultNmax -1 "
+        "--outSAMtype BAM SortedByCoordinate --outBAMsortingThreadN 2 "
+        "--limitBAMsortRAM 168824282496 --twopassMode None "
+        "--outFilterType BySJout --alignSJoverhangMin 8 --alignSJDBoverhangMin 1 "
+        "--outFilterMismatchNmax 999 --alignIntronMin 20 --alignIntronMax 1000000 "
+        "--alignMatesGapMax 1000000 > {log:q} 2>&1"
+
+
+rule te_count:
+    input:
+        bam=os.path.join(ALIGN_DIR, "{sample}Aligned.sortedByCoord.out.bam"),
+        gene=GENOME_ANNOTATION,
+        te=TE_ANNOTATION
+    output:
+        table=os.path.join(ABUNDANCE_DIR, "{sample}.cntTable")
+    params:
+        outdir=lambda wildcards: ABUNDANCE_DIR.format(sample=wildcards.sample)
+    threads:
+        1
+    resources:
+        mem_mb=32000
+    log:
+        os.path.join(LOG_DIR, "{sample}.TEcount.log")
+    shell:
+        "TEcount --format BAM --mode multi -b {input.bam:q} "
+        "--GTF {input.gene:q} --TE {input.te:q} --sortByPos "
+        "--project {wildcards.sample:q} --outdir {params.outdir:q} > {log:q} 2>&1"
+
+
+rule merge_counts:
+    input:
+        counts=count_tables,
+        manifest=MANIFEST
+    output:
+        os.path.join(OUTPUT_DIR, "merged.count")
+    threads:
+        1
+    resources:
+        mem_mb=4000
+    log:
+        os.path.join(LOG_DIR, "merge_counts.log")
+    script:
+        "scripts/merge_counts.py"

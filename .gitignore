@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+state/
+verification/
+*.log
+setup/install-status.json
+setup/micromamba.tar.bz2
+setup/bin/
+.env
+.env.*
+!.env.example
+.git-credentials

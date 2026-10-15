@@ -1,0 +1,14 @@
+raw_root: /root/nfsdata/TEatlas/bulk_rna
+output_root: /root/TEatlas/bulk_rna
+template_dir: /root/TEatlas/bulk_rna/SRA00000
+template_home: /root
+environment: /root/miniconda3/envs/TE
+threads: 10
+mem_mb: 256000
+total_cores: auto
+total_mem_mb: auto
+resource_fraction: 0.8
+scheduler_interval: 1
+download_retries: 3
+metadata_timeout: 180
+proxy_env: /home/codex/server-213-setup/proxy.env
