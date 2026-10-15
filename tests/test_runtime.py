@@ -186,6 +186,24 @@ def test_missing_raw_manifest_uses_nested_record_paths(manager):
     assert not runtime.raw_manifest_valid(job)
 
 
+def test_single_raw_manifest_accepts_one_read_and_rejects_conflicting_layout(manager):
+    job = manager.submit("SRR1", data_type="bulk")
+    read = Path(job["raw_dir"]) / "SRR1.fastq.gz"
+    read.write_bytes(b"read")
+    sample = {"library_layout": "SINGLE", "r1": str(read), "r2": None,
+              "files": [{"name": read.name, "bytes": 4}]}
+    manifest = Path(job["job_dir"]) / "samples.json"
+    document = {"accession": "SRR1", "samples": {"SRR1": sample}}
+    manifest.write_text(json.dumps(document))
+    assert runtime.raw_manifest_valid(job)
+    sample["r2"] = str(read)
+    manifest.write_text(json.dumps(document))
+    assert not runtime.raw_manifest_valid(job)
+    sample.update(r2=None, library_layout="UNKNOWN")
+    manifest.write_text(json.dumps(document))
+    assert not runtime.raw_manifest_valid(job)
+
+
 def test_queued_jobs_survive_without_worker_pid_and_dead_running_interrupts(manager, monkeypatch):
     manager.submit("GSE1", data_type="bulk")
     monkeypatch.setattr(runtime, "pid_alive", lambda pid: False)

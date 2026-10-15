@@ -1,6 +1,6 @@
-"""Read-only, bounded result-directory browsing for the terminal interface.
+"""Read-only, bounded input/result browsing for the terminal interface.
 
-The browser never follows a result path outside the selected job directory.
+The browser never follows a path outside the selected input or result root.
 Pages are indexed by byte offsets, not by repeatedly reading the entire file.
 Scientific outputs are not modified by this module.
 """
@@ -148,17 +148,19 @@ def _signature(path: Path, info: os.stat_result) -> tuple:
     return (str(path), info.st_mtime_ns, info.st_size, info.st_ino)
 
 
-def _root(job: dict) -> Path:
-    value = job.get("job_dir")
+def _root(job: dict, source: str = "output") -> Path:
+    if source not in {"output", "input"}:
+        raise ValueError("目录类型必须是 output 或 input。")
+    value = job.get("raw_dir" if source == "input" else "job_dir")
     if not value:
-        raise ValueError("该项目尚未指定结果目录。")
+        raise ValueError("该项目尚未指定输入目录。" if source == "input" else "该项目尚未指定结果目录。")
     return Path(value).expanduser().resolve()
 
 
 def _inside(root: Path, candidate: Path) -> Path:
     path = candidate.resolve()
     if not path.is_relative_to(root):
-        raise ValueError("该文件不在当前项目的结果目录内。")
+        raise ValueError("该文件不在当前项目的所选目录内。")
     return path
 
 
@@ -189,8 +191,10 @@ def _hidden(name: str) -> bool:
             or "_startmp" in low or low.endswith((".tmp", ".temp")))
 
 
-def _kind(path: Path) -> str:
+def _kind(path: Path, *, native_sra: bool = False) -> str:
     name = path.name.lower()
+    if native_sra and RUN_RE.fullmatch(path.name):
+        return "compressed"
     if name.endswith((".cnttable", ".count", ".tsv", ".csv")):
         return "table"
     if name.endswith(".bam"):
@@ -204,13 +208,13 @@ def _kind(path: Path) -> str:
     return "text"
 
 
-def _file(root: Path, path: Path, relative_root: Path) -> ResultFile | None:
+def _file(root: Path, path: Path, relative_root: Path, *, source: str = "output") -> ResultFile | None:
     try:
         resolved = _inside(root, path)
         info = _regular(resolved)
         relative = (path.relative_to(relative_root) if path.is_relative_to(relative_root)
                     else path.relative_to(root))
-        return ResultFile(resolved, relative.as_posix(), path.name, _kind(path),
+        return ResultFile(resolved, relative.as_posix(), path.name, _kind(path, native_sra=source == "input"),
                           info.st_size, info.st_mtime_ns)
     except (OSError, ValueError):
         return None
@@ -294,19 +298,23 @@ class ResultBrowser:
         self._indices: OrderedDict[str, _FileIndex] = OrderedDict()
         self._lock = threading.RLock()
 
-    def list_project(self, job: dict, show_internal: bool = False) -> ProjectListing:
+    def list_project(self, job: dict, show_internal: bool = False, *, source: str = "output") -> ProjectListing:
         try:
-            root = _root(job)
-            if not root.exists():
-                return ProjectListing(error="结果目录尚未创建。")
-            if not root.is_dir():
-                return ProjectListing(error="结果路径不是文件夹。")
+            root = _root(job, source)
+            label = "输入" if source == "input" else "结果"
+            root_exists = root.exists()
+            if root_exists and not root.is_dir():
+                return ProjectListing(error=f"{label}路径不是文件夹。")
             runs: set[str] = set()
             metadata_signature = []
+            # Output manifests name planned Runs before their raw directories
+            # appear. They supply identities only; never include output files in
+            # the input listing or relax the input preview's security root.
+            manifest_root = (_root(job) if job.get("job_dir") else root) if source == "input" else root
             for name in ("samples.json", "samples.tsv"):
-                path = root / name
+                path = manifest_root / name
                 try:
-                    data = _bounded_bytes(root, path)
+                    data = _bounded_bytes(manifest_root, path)
                     metadata_signature.append(_signature(path, path.stat()))
                     if name.endswith("json"):
                         document = json.loads(data.decode("utf-8-sig"))
@@ -326,7 +334,7 @@ class ResultBrowser:
                     # other metadata source and physical directories remain useful.
                     pass
             files = []
-            for position, entry in enumerate(root.iterdir()):
+            for position, entry in enumerate(root.iterdir() if root_exists else []):
                 if position >= MAX_LIST_FILES:
                     break
                 if not show_internal and _hidden(entry.name):
@@ -335,7 +343,7 @@ class ResultBrowser:
                     path = _inside(root, entry)
                     if path.is_dir() and RUN_RE.fullmatch(entry.name):
                         runs.add(entry.name.upper())
-                    elif (item := _file(root, entry, root)) is not None:
+                    elif (item := _file(root, entry, root, source=source)) is not None:
                         files.append(item)
                 except (OSError, ValueError):
                     continue
@@ -347,21 +355,24 @@ class ResultBrowser:
                 runs.add(accession)
             files.sort(key=lambda item: item.relative.lower())
             ordered_runs = sorted(runs)
-            signature = (str(root), tuple(ordered_runs), tuple(metadata_signature),
+            signature = (source, str(root), tuple(ordered_runs), tuple(metadata_signature),
                          tuple((str(item.path), item.size, item.modified_ns) for item in files))
-            return ProjectListing(ordered_runs, files, signature)
+            return ProjectListing(ordered_runs, files, signature, "" if root_exists else f"{label}目录尚未创建。")
         except PermissionError:
-            return ProjectListing(error="没有权限读取该项目的结果目录。")
+            return ProjectListing(error="没有权限读取该项目的所选目录。")
         except (OSError, ValueError) as exc:
-            return ProjectListing(error=f"无法读取结果目录：{exc}")
+            return ProjectListing(error=f"无法读取目录：{exc}")
 
     def list_files(self, job: dict, run: str | None = None,
-                   show_internal: bool = False) -> list[ResultFile]:
-        root = _root(job)
+                   show_internal: bool = False, *, source: str = "output") -> list[ResultFile]:
+        root = _root(job, source)
         if run is not None and not RUN_RE.fullmatch(run):
             raise ValueError("无效的 Run 编号。")
         legacy = run and str(job.get("accession", "")).upper() == run.upper()
         scope = root if not run or legacy else _inside(root, root / run)
+        accession = str(job.get("accession", "")).upper()
+        if source == "input" and RUN_RE.fullmatch(accession) and (root / accession).is_dir():
+            scope = _inside(root, root / accession)
         exists = scope.exists()
         if exists and not scope.is_dir():
             raise ValueError("选中的结果路径不是文件夹。")
@@ -384,12 +395,12 @@ class ResultBrowser:
                         if entry.is_dir(follow_symlinks=False):
                             if not (not run and RUN_RE.fullmatch(entry.name)):
                                 pending.append(_inside(root, path))
-                        elif (item := _file(root, path, scope)) is not None:
+                        elif (item := _file(root, path, scope, source=source)) is not None:
                             files[item.path] = item
                     except FileNotFoundError:
                         # Writers can remove temporary outputs between refreshes.
                         continue
-        if run and not legacy:
+        if source == "output" and run and not legacy:
             log_root = root / "logs"
             try:
                 resolved_logs = _inside(root, log_root)
@@ -407,16 +418,16 @@ class ResultBrowser:
                 pass
         return sorted(files.values(), key=lambda item: item.relative.lower())
 
-    def preview(self, job: dict, file_path: str | Path, page: int = 0) -> PreviewPage:
+    def preview(self, job: dict, file_path: str | Path, page: int = 0, *, source: str = "output") -> PreviewPage:
         path = Path(file_path)
         try:
             if not isinstance(page, int) or page < 0:
                 raise ValueError("页码必须是非负整数。")
-            root = _root(job)
+            root = _root(job, source)
             path = _inside(root, path if path.is_absolute() else root / path)
             info = _regular(path)
             signature = _signature(path, info)
-            kind = _kind(path)
+            kind = _kind(path, native_sra=source == "input")
             if kind in {"bam", "compressed", "html", "binary"}:
                 return self._summary(path, info, kind, page, signature)
             with self._lock, _open_regular(path) as handle:

@@ -12,11 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "workflow" / "scrip
 import prepare_samples as pipeline
 
 
-def test_known_single_end_is_explicit_not_unknown_layout():
-    with pytest.raises(KnownFailure) as captured:
-        pipeline.paired_files({"library_layout": "SINGLE"}, "SRR1")
-    assert captured.value.failure["run"] == "SRR1"
-    assert captured.value.failure["code"] == "single_end"
+def test_single_end_is_supported_and_unknown_layout_still_fails():
+    files = pipeline.fastq_files({"library_layout": "SINGLE"}, "SRR1")
+    assert files == [{"name": "SRR1.fastq.gz", "bytes": None, "mate": 1, "source": "sra-converted"}]
     with pytest.raises(ValueError) as unknown:
         pipeline.paired_files({"library_layout": ""}, "SRR1")
     assert not isinstance(unknown.value, KnownFailure)

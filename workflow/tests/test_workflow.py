@@ -71,7 +71,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(pair), 2)
         self.assertTrue(pair[0]["name"].endswith("_1.fastq.gz"))
 
-    def test_missing_ambiguous_or_single_pair_fails(self):
+    def test_missing_ambiguous_or_multifile_single_pair_fails(self):
         for row in (self.row(layout="SINGLE"), self.row(files=["SRR123456_1.fastq.gz"]),
                     self.row(files=["alpha.fastq.gz", "beta.fastq.gz"]),
                     self.row(files=["laneA_R1.fastq.gz", "laneB_R1.fastq.gz", "laneA_R2.fastq.gz"])):

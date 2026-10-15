@@ -43,6 +43,15 @@ def test_interleaved_jobs_finish_their_own_run(job):
     assert first["status"] == "queued" and "等待" in first["step"]
 
 
+def test_single_end_quality_control_uses_same_activity_stage(job):
+    recorder = journal(job)
+    rule(recorder, "quality_control_single", 4, "SRR1")
+    recorder.feed("Finished jobid: 4 (Rule: quality_control_single)")
+    events = [item for item in recorder.events if item.get("run") == "SRR1"]
+    assert [(item["stage"], item["step"], item["state"]) for item in events] == [
+        ("analyze", "质控", "running"), ("analyze", "质控", "succeeded")]
+
+
 def test_failed_parallel_job_uses_error_jobid_without_wildcards(job):
     recorder = journal(job)
     rule(recorder, "te_count", 4, "SRR1")

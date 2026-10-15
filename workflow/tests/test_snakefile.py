@@ -94,6 +94,83 @@ class SnakefileDagTests(unittest.TestCase):
             self.assertIn(str(self.output / run / "qc" / f"{run}_clean_R1.fq.gz"), output)
             self.assertNotIn(str(self.output / run / "merged.count"), output)
 
+    def write_layout_manifest(self, layouts):
+        accession = "GSE123456" if len(layouts) > 1 else next(iter(layouts))
+        config = json.loads(self.config.read_text())
+        config["ACCESSION"] = accession
+        self.config.write_text(json.dumps(config))
+        samples = {}
+        for run, layout in layouts.items():
+            directory = self.raw / run if accession.startswith("GSE") else self.raw
+            directory.mkdir(exist_ok=True)
+            names = [f"{run}.fastq.gz"] if layout == "SINGLE" else [f"{run}_{mate}.fastq.gz" for mate in (1, 2)]
+            for name in names:
+                with gzip.open(directory / name, "wt") as handle:
+                    handle.write("@read\nACGT\n+\nIIII\n")
+            samples[run] = {"library_layout": layout, "r1": str(directory / names[0]),
+                            "r2": str(directory / names[1]) if len(names) == 2 else None}
+        (self.output / "samples.json").write_text(json.dumps({"accession": accession, "samples": samples}))
+        return samples
+
+    def test_single_manifest_schedules_one_read_fastp_and_star_without_r2(self):
+        self.write_layout_manifest({"SRR123456": "SINGLE"})
+        output = self.dry_run()
+        self.assertIn("rule quality_control_single:", output)
+        self.assertNotIn("rule quality_control:", output)
+        self.assertNotIn("_clean_R2", output)
+        fastp = next(line for line in output.splitlines() if "fastp -w " in line)
+        self.assertNotIn(" -I ", fastp)
+        self.assertNotIn(" -O ", fastp)
+        star = next(line for line in output.splitlines() if "STAR --genomeDir " in line)
+        self.assertIn("_clean_R1.fq.gz", star)
+        self.assertIn("--outFilterMultimapNmax 100 --winAnchorMultimapNmax 100", star)
+        self.assertIn("--limitBAMsortRAM 168824282496", star)
+        self.assertIn("TEcount --format BAM --mode multi", output)
+        self.assertNotIn("--fragmentLength", output)
+
+    def test_mixed_manifest_selects_both_qc_branches_and_one_project_merge(self):
+        self.write_layout_manifest({"SRR123456": "SINGLE", "SRR654321": "PAIRED"})
+        output = self.dry_run()
+        self.assertIn("rule quality_control_single:", output)
+        self.assertIn("rule quality_control:", output)
+        self.assertIn("rule merge_counts:", output)
+        self.assertIn("SRR654321_clean_R2.fq.gz", output)
+        self.assertNotIn("SRR123456_clean_R2.fq.gz", output)
+        self.assertIn("--alignMatesGapMax 1000000", output)
+
+    def test_missing_clean_read_rebuilds_qc_even_when_completion_marker_exists(self):
+        for layout in ("SINGLE", "PAIRED"):
+            with self.subTest(layout=layout):
+                self.write_layout_manifest({"SRR123456": layout})
+                qc = self.output / "qc"
+                qc.mkdir(exist_ok=True)
+                names = ["SRR123456_clean_R1.fq.gz", "SRR123456.html", "SRR123456.json"]
+                if layout == "PAIRED":
+                    names.append("SRR123456_clean_R2.fq.gz")
+                for name in names:
+                    (qc / name).write_bytes(b"fixture")
+                (qc / f".teflow-SRR123456-{layout.lower()}.complete").touch()
+                ready = self.dry_run()
+                rule = "quality_control_single" if layout == "SINGLE" else "quality_control"
+                self.assertNotIn(f"rule {rule}:", ready)
+                missing = "SRR123456_clean_R1.fq.gz" if layout == "SINGLE" else "SRR123456_clean_R2.fq.gz"
+                (qc / missing).unlink()
+                rebuilt = self.dry_run()
+                self.assertIn(f"rule {rule}:", rebuilt)
+
+    def test_unknown_manifest_layout_fails_before_scientific_tools(self):
+        self.write_layout_manifest({"SRR123456": "SINGLE"})
+        manifest = self.output / "samples.json"
+        document = json.loads(manifest.read_text())
+        document["samples"]["SRR123456"]["library_layout"] = "UNKNOWN"
+        manifest.write_text(json.dumps(document))
+        result = subprocess.run([
+            sys.executable, "-m", "snakemake", "--dry-run", "--snakefile", str(self.snakefile),
+            "--directory", str(self.output), "--configfile", str(self.config), "--cores", "10"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("单双端类型", result.stdout)
+
     @unittest.skipUnless(os.name == "posix", "执行回归需要 Linux")
     def test_prepare_and_merge_scripts_execute_under_real_snakemake_injection(self):
         mock_iseq = self.directory / "mock-iseq"

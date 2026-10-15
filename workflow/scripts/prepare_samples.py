@@ -1,4 +1,4 @@
-"""Prepare a complete, metadata-mapped paired FASTQ manifest through iSeq.
+"""Prepare a complete, metadata-mapped SINGLE/PAIRED FASTQ manifest through iSeq.
 
 Network clients inherit the active proxy environment. Downloads are sequential,
 so iSeq's success/failure logs are never modified by simultaneous iSeq calls.
@@ -116,22 +116,28 @@ def _safe_fastq_name(url: str) -> str:
     return name
 
 
-def paired_files(row: dict, run: str) -> list[dict]:
-    """Select R1/R2 by metadata names; never infer samples from directory contents."""
+def fastq_files(row: dict, run: str) -> list[dict]:
+    """Select each Run's reads from its authoritative layout and metadata names."""
     layout = str(row.get("library_layout", row.get("LibraryLayout", ""))).strip().upper()
-    if layout != "PAIRED":
-        if layout == "SINGLE":
-            raise KnownFailure("single_end", f"{run} 是单端数据，当前分析流程要求双端数据。",
-                               detail=f"{run}: 当前分析模板需要双端 PAIRED 数据，实际 layout=SINGLE。", run=run)
-        raise ValueError(f"{run}: 当前分析模板需要双端 PAIRED 数据，实际 layout={layout or '未知'}。")
+    if layout not in {"SINGLE", "PAIRED"}:
+        raise ValueError(f"{run}: 无法识别单双端类型，实际 layout={layout or '未知'}。")
     links = [link.strip() for link in str(row.get("fastq_ftp", "")).split(";") if link.strip()]
     if not links:
         # iSeq's SRA fallback converts the downloaded archive to these filenames.
+        if layout == "SINGLE":
+            return [{"name": f"{run}.fastq.gz", "bytes": None, "mate": 1, "source": "sra-converted"}]
         return [{"name": f"{run}_{mate}.fastq.gz", "bytes": None, "mate": mate, "source": "sra-converted"}
                 for mate in (1, 2)]
     sizes = str(row.get("fastq_bytes", "")).split(";")
     if len(sizes) != len(links):
         raise ValueError(f"{run}: 元数据 FASTQ 链接与大小数量不一致。")
+    if layout == "SINGLE":
+        if len(links) != 1:
+            raise ValueError(f"{run}: 单端 Run 对应多份 FASTQ，无法唯一确定输入，需明确文件含义。")
+        name = _safe_fastq_name(links[0])
+        if not sizes[0].isdigit() or int(sizes[0]) <= 0:
+            raise ValueError(f"{run}: 元数据 FASTQ 大小无效: {name}")
+        return [{"name": name, "bytes": int(sizes[0]), "mate": 1, "source": "ena-fastq"}]
     by_mate = {}
     all_names = set()
     for link, size in zip(links, sizes):
@@ -155,6 +161,11 @@ def paired_files(row: dict, run: str) -> list[dict]:
     return [by_mate[1], by_mate[2]]
 
 
+def paired_files(row: dict, run: str) -> list[dict]:
+    """Compatibility name for callers; selection now supports both layouts."""
+    return fastq_files(row, run)
+
+
 def parse_metadata(path: Path, allow_duplicate_names=False) -> tuple[list[str], dict[str, dict]]:
     with Path(path).open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
@@ -172,8 +183,9 @@ def parse_metadata(path: Path, allow_duplicate_names=False) -> tuple[list[str], 
             run = row[run_field].strip()
             if not RUN_PATTERN.fullmatch(run):
                 raise MetadataFormatError(f"元数据包含无效 Run 编号: {run}")
-            files = paired_files(row, run)
-            record = {"row": row, "files": files, "library_layout": "PAIRED"}
+            files = fastq_files(row, run)
+            layout = str(row.get("library_layout", row.get("LibraryLayout", ""))).strip().upper()
+            record = {"row": row, "files": files, "library_layout": layout}
             if run in records and records[run] != record:
                 raise ValueError(f"元数据包含相互冲突的 Run 记录: {run}")
             if run in records:
@@ -290,7 +302,8 @@ def experiment_metadata(experiment: str) -> dict[str, dict]:
         strategy = row.get("library_strategy", "").strip().upper()
         if strategy and strategy not in {"RNA-SEQ", "RNA_SEQ"}:
             raise ValueError(f"{experiment}/{run}: 当前 bulk 模板需要 RNA-Seq，实际为 {strategy}。")
-        record = {"row": row, "files": paired_files(row, run), "library_layout": "PAIRED"}
+        layout = str(row.get("library_layout", row.get("LibraryLayout", ""))).strip().upper()
+        record = {"row": row, "files": fastq_files(row, run), "library_layout": layout}
         if run in records and record != records[run]:
             raise ValueError(f"{experiment}: 同一 Run 元数据相互冲突: {run}")
         records[run] = record
@@ -615,7 +628,10 @@ def obtain_geo_metadata(accession: str, samples_dir: Path, log):
                     cached.get("metadata_bytes") == metadata.stat().st_size and
                     list(parsed) == list(cached["records"]) and cached.get("mapping") and
                     all(parsed[run]["row"] == cached["records"][run]["row"] for run in parsed)):
-                return metadata, cached["fields"], cached["records"], cached["mapping"]
+                # Older caches can omit derived layout/file fields. Recompute
+                # these from the verified TSV while retaining GEO associations.
+                records = {run: {**cached["records"][run], **record} for run, record in parsed.items()}
+                return metadata, cached["fields"], records, cached["mapping"]
         except (OSError, ValueError, KeyError, TypeError):
             pass
     log_message(f"解析 {accession} 自身的 GSM 样本及对应全部 Run。", log)
@@ -673,7 +689,10 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
             raw_dir.mkdir(parents=True, exist_ok=True)
             record["raw_dir"] = str(raw_dir)
         raw_bytes = check_space(samples_dir, output_dir, records, float(output_space_multiplier))
-        log_message(f"共 {len(records)} 个双端 Run；全部纳入，FASTQ 大小 {raw_bytes / 1024**3:.2f} GiB。", log)
+        single_runs = sum(record["library_layout"] == "SINGLE" for record in records.values())
+        paired_runs = len(records) - single_runs
+        log_message(f"共 {len(records)} 个 Run（单端 {single_runs}、双端 {paired_runs}）；全部纳入，"
+                    f"FASTQ 大小 {raw_bytes / 1024**3:.2f} GiB。", log)
         samples = {}
         progress("download", total_runs=len(records), downloaded_runs=0, step="准备下载")
         for index, (run, record) in enumerate(records.items(), 1):
@@ -697,7 +716,7 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
                     remove_success_marker(success_log, run)
                     if files[0]["source"] == "sra-converted" and not pair_is_complete(run_dir, files):
                         # A partial SRA conversion prevents iSeq from converting
-                        # again. Remove only these two known derived FASTQs.
+                        # again. Remove only the explicitly expected derived FASTQs.
                         for item in files:
                             (run_dir / item["name"]).unlink(missing_ok=True)
                     log_message(f"Run {index}/{len(records)} {run}: iSeq 下载（{attempt}/{retries}）。", log)
@@ -725,7 +744,7 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
                     raise RuntimeError(f"{run}: {retries} 次下载后仍未完成；已下载数据保留，可重试。{last_error}") from last_error
             count_root = output_dir / run if geo else output_dir
             samples[run] = {"r1": str(run_dir / files[0]["name"]),
-                            "r2": str(run_dir / files[1]["name"]),
+                            "r2": str(run_dir / files[1]["name"]) if record["library_layout"] == "PAIRED" else None,
                             "raw_dir": str(run_dir),
                             "count_path": str(count_root / "abundance" / f"{run}.cntTable"),
                             "geo_samples": record.get("geo_samples", []),
@@ -733,7 +752,7 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
                             "files": [{"name": item["name"], "path": str(run_dir / item["name"]),
                                        "bytes": (run_dir / item["name"]).stat().st_size}
                                       for item in files],
-                            "library_layout": "PAIRED", "download_status": status}
+                            "library_layout": record["library_layout"], "download_status": status}
             progress("download", total_runs=len(records), downloaded_runs=index,
                      current_sample=run, step="FASTQ 已就绪")
         document = {"accession": accession, "samples": samples, "total_runs": len(samples),

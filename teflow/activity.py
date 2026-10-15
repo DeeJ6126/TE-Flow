@@ -22,6 +22,7 @@ CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 RULES = {
     "prepare_samples": ("metadata", "解析项目"),
     "quality_control": ("analyze", "质控"),
+    "quality_control_single": ("analyze", "质控"),
     "star_align": ("analyze", "比对"),
     "te_count": ("analyze", "TE 计数"),
     "merge_counts": ("merge", "汇总结果"),
@@ -141,7 +142,7 @@ class ActivityRecorder:
         if not item or item.get("emitted") or not item.get("jobid"):
             return
         rule = item["rule"]
-        if rule not in RULES or (rule in {"quality_control", "star_align", "te_count"} and not item.get("run")):
+        if rule not in RULES or (rule in {"quality_control", "quality_control_single", "star_align", "te_count"} and not item.get("run")):
             return
         stage, step = RULES[rule]
         self.jobs[item["jobid"]] = dict(item)

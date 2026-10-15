@@ -52,7 +52,7 @@ def requirements_for_job(accession: str, raw_dir: Path) -> list[tuple[str, ...]]
         runs = [row.get("run_accession", row.get("Run")) for row in rows]
         if cached.get("accession") != accession or not rows:
             return required_groups([accession])
-        if any(str(row.get("library_layout", row.get("LibraryLayout", ""))).upper() != "PAIRED" for row in rows):
+        if any(str(row.get("library_layout", row.get("LibraryLayout", ""))).strip().upper() not in {"SINGLE", "PAIRED"} for row in rows):
             return required_groups([accession])
         if geo:
             records = cached.get("records", {})
@@ -96,16 +96,20 @@ def _cached_pair_ready(run: str, row: dict, raw_dir: Path) -> bool:
             return False
         links = [url.strip() for url in str(row.get("fastq_ftp", "")).split(";") if url.strip()]
         sizes = str(row.get("fastq_bytes", "")).split(";")
+        layout = str(row.get("library_layout", row.get("LibraryLayout", ""))).strip().upper()
         # Converted SRA needs a full gzip EOF check in the real downloader, so
         # only ENA pairs with independently known compressed lengths skip here.
-        if not links or len(links) != len(sizes):
+        if (not links or len(links) != len(sizes) or layout not in {"SINGLE", "PAIRED"}
+                or (layout == "SINGLE" and len(links) != 1)):
             return False
         mates = {}
         for url, size in zip(links, sizes):
             name = Path(unquote(urlsplit(url if "://" in url else "https://" + url).path)).name
             match = re.search(r"(?:^|[_.-])(?:R)?([12])(?:_\d+)?\.(?:fastq|fq)\.gz$", name, re.IGNORECASE)
-            if match:
-                if match[1] in mates or not size.isdigit():
+            if match or layout == "SINGLE":
+                mate = "1" if layout == "SINGLE" else match[1]
+                if (mate in mates or not size.isdigit() or
+                        not re.fullmatch(r"[^/\\]+\.(?:fastq|fq)\.gz", name, re.IGNORECASE)):
                     return False
                 path = raw_dir / name
                 if not path.is_file() or path.stat().st_size != int(size) or not int(size):
@@ -115,8 +119,8 @@ def _cached_pair_ready(run: str, row: dict, raw_dir: Path) -> bool:
                 if (not header.startswith(b"@") or not separator.startswith(b"+") or not sequence.strip()
                         or len(sequence.rstrip(b"\r\n")) != len(quality.rstrip(b"\r\n"))):
                     return False
-                mates[match[1]] = path
-        return set(mates) == {"1", "2"}
+                mates[mate] = path
+        return set(mates) == ({"1"} if layout == "SINGLE" else {"1", "2"})
     except (OSError, EOFError, ValueError, zlib.error):
         return False
 

@@ -51,6 +51,32 @@ def fastq(raw, run, mate=1, geo=True):
     return (raw / run if geo else raw) / f"{run}_{mate}.fastq.gz"
 
 
+@pytest.mark.parametrize("filename", ["SRR1.fastq.gz", "SRR1_1.fastq.gz"])
+def test_single_metadata_progress_counts_exactly_one_file(tmp_path, filename):
+    job, raw, output = setup_job(tmp_path, geo=False, runs=("SRR1",))
+    row = {"run_accession": "SRR1", "library_layout": "SINGLE",
+           "fastq_ftp": "ftp.sra.ebi.ac.uk/" + filename, "fastq_bytes": "100"}
+    with (raw / "SRR1.metadata.tsv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row), delimiter="\t")
+        writer.writeheader()
+        writer.writerow(row)
+    sparse(raw / filename, 50)
+    sparse(raw / "SRR1_2.fastq.gz", 9999)
+    snap = ProgressTracker().snapshot(job)
+    assert snap.current_bytes == 50 and snap.total_bytes == 100 and snap.percent == 50
+
+
+def test_single_sra_fallback_progress_has_one_unknown_size_file(tmp_path):
+    job, raw, output = setup_job(tmp_path, geo=False, runs=("SRR1",))
+    (raw / "SRR1.metadata.tsv").write_text("Run\tLibraryLayout\nSRR1\tSINGLE\n")
+    sparse(raw / "SRR1.fastq.gz", 50)
+    snap = ProgressTracker().snapshot(job)
+    assert snap.label == "转换 FASTQ" and snap.total_bytes is None and snap.percent is None
+    from teflow.progress import _files_from_row
+    assert _files_from_row("SRR1", {"LibraryLayout": "SINGLE"}) == [
+        ("SRR1.fastq.gz", None, "sra-converted")]
+
+
 def test_geo_project_aggregates_only_mapped_files_and_reads_existing_worker(tmp_path):
     job, raw, output = setup_job(tmp_path)
     sparse(fastq(raw, "SRR1"), 100)

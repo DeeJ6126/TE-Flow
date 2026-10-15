@@ -82,7 +82,7 @@ class GeoTests(unittest.TestCase):
                 pipeline.resolve_geo_series("GSE1")
         self.assertEqual(request.call_count, 1)
 
-    def test_wrong_experiment_and_single_end_fail_before_download(self):
+    def test_wrong_experiment_and_ambiguous_multifile_single_fail_before_download(self):
         for record in (row("SRR1", "SRX99"), row("SRR1", layout="SINGLE")):
             with patch.object(pipeline, "_request_text", return_value=tsv([record])):
                 with self.assertRaises(ValueError):

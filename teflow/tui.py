@@ -88,6 +88,7 @@ class TEFlowApp(App):
     #overview { height: 5; border: double $accent; padding: 0 1; }
     #workspace { height: 1fr; }
     #history-panel { width: 27; border: solid $primary-background; }
+    #directory-source { height: 1; min-height: 1; width: 1fr; border: none; padding: 0; color: $accent; }
     #files-panel { width: 34; border: solid $primary-background; }
     .panel-title { height: 1; padding: 0 1; color: $text-muted; }
     #projects, #files { height: 1fr; }
@@ -137,6 +138,11 @@ class TEFlowApp(App):
         self.selected_accession: str | None = None
         self.selected_run: str | None = None
         self.selected_file: Path | None = None
+        self.directory_source = "output"
+        self._directory_views: dict[tuple, dict] = {}
+        self._directory_trees: dict[str, dict] = {}
+        self._pending_directory_view = self._pending_directory_tree = None
+        self._pending_preview_view = None
         self.preview_page = 0
         self.show_internal = self.logs_visible = False
         self._submission_accessions: set[str] = set()
@@ -171,6 +177,7 @@ class TEFlowApp(App):
     def _compose_workspace(self) -> ComposeResult:
         with Horizontal(id="workspace"):
             with Vertical(id="history-panel"):
+                yield Button("输出目录 ⇄", id="directory-source", tooltip="点击切换到输入目录；只影响文件浏览。")
                 yield Static("项目 / Run · 回车选择", classes="panel-title")
                 yield Tree("项目", id="projects")
             yield Splitter(vertical=True, id="history-splitter")
@@ -276,7 +283,7 @@ class TEFlowApp(App):
             self.action_start()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        action = {"start": self.action_start, "toggle-internal": self.action_toggle_internal, "copy-page": self.action_copy_page, "previous-page": lambda: self._change_page(-1), "next-page": lambda: self._change_page(1)}.get(event.button.id)
+        action = {"start": self.action_start, "directory-source": self.action_toggle_directory_source, "toggle-internal": self.action_toggle_internal, "copy-page": self.action_copy_page, "previous-page": lambda: self._change_page(-1), "next-page": lambda: self._change_page(1)}.get(event.button.id)
         if action:
             action()
 
@@ -330,8 +337,9 @@ class TEFlowApp(App):
             self._file_signature = self._last_log = None
             self._clear_preview()
             self._files.clear()
-            self.query_one("#files", ResultFileTree).clear_files(scope_key=(accession, run))
-            self.query_one("#files-empty", Static).update("正在读取结果文件…")
+            self._pending_directory_view = self._pending_preview_view = None
+            self.query_one("#files", ResultFileTree).clear_files(scope_key=(self.directory_source, accession, run))
+            self.query_one("#files-empty", Static).update("正在读取输入文件…" if self.directory_source == "input" else "正在读取结果文件…")
             logs = self.query_one("#logs", LiveLog)
             logs.clear()
             logs.following = logs.auto_scroll = True
@@ -350,6 +358,38 @@ class TEFlowApp(App):
         self._open_file(event.path)
 
     def action_refresh(self) -> None:
+        self.refresh_jobs()
+
+    def action_toggle_directory_source(self) -> None:
+        """Switch read-only file roots without changing the selected job's logs."""
+        projects = self.query_one("#projects", Tree)
+        files = self.query_one("#files", ResultFileTree)
+        preview = self.query_one("#preview-table" if self.query_one("#preview-table").display else "#preview-text", SelectablePreview)
+        self._directory_trees[self.directory_source] = {
+            "expanded": {key for key, node in self._project_nodes.items() if node.is_expanded},
+            "cursor": projects.cursor_node.data if projects.cursor_node else None,
+            "scroll": (projects.scroll_x, projects.scroll_y),
+        }
+        self._directory_views[(self.directory_source, self.selected_accession, self.selected_run)] = {
+            "path": self.selected_file, "page": self.preview_page,
+            "expanded": {key for key, node in files.directory_nodes.items() if node.is_expanded},
+            "cursor": files.cursor_node.data if files.cursor_node else None,
+            "scroll": (files.scroll_x, files.scroll_y),
+            "preview_selection": preview.selection,
+            "preview_scroll": (preview.scroll_x, preview.scroll_y),
+        }
+        self.directory_source = "input" if self.directory_source == "output" else "output"
+        button = self.query_one("#directory-source", Button)
+        button.label = "输入目录 ⇄" if self.directory_source == "input" else "输出目录 ⇄"
+        button.tooltip = "点击切换到输出目录；只影响文件浏览。" if self.directory_source == "input" else "点击切换到输入目录；只影响文件浏览。"
+        self._scope_version += 1
+        self._tree_signature = self._file_signature = None
+        self._clear_preview()
+        self._files.clear()
+        files.clear_files(scope_key=(self.directory_source, self.selected_accession, self.selected_run))
+        self._pending_directory_view = self._directory_views.get((self.directory_source, self.selected_accession, self.selected_run))
+        self._pending_directory_tree = self._directory_trees.get(self.directory_source)
+        self.query_one("#files-empty", Static).update("正在读取输入文件…" if self.directory_source == "input" else "正在读取结果文件…")
         self.refresh_jobs()
 
     def action_toggle_internal(self) -> None:
@@ -374,20 +414,20 @@ class TEFlowApp(App):
             self._last_log = None
             self.refresh_jobs()
 
-    def _snapshot(self, requested, run, show_internal, include_logs):
+    def _snapshot(self, requested, run, show_internal, include_logs, directory_source):
         jobs = sorted(self.manager.list_jobs(), key=lambda job: str(job.get("created_at") or ""), reverse=True)
         identifiers = {str(job["accession"]) for job in jobs}
         selected = requested if requested in identifiers else (str(jobs[0]["accession"]) if jobs else None)
         detail = self.manager.get_job(selected) if selected else None
-        listings = {str(job["accession"]): self.browser.list_project(job, show_internal=show_internal) for job in jobs}
+        listings = {str(job["accession"]): self.browser.list_project(job, show_internal=show_internal, source=directory_source) for job in jobs}
         if not detail:
             return jobs, selected, detail, listings, [], None, None
         selected_run = run if selected == requested else None
         try:
-            files = self.browser.list_files(detail, run=selected_run, show_internal=show_internal)
+            files = self.browser.list_files(detail, run=selected_run, show_internal=show_internal, source=directory_source)
         except (OSError, ValueError) as exc:
             files = []
-            listings[selected].error = f"无法读取结果文件：{exc}"
+            listings[selected].error = f"无法读取{'输入' if directory_source == 'input' else '结果'}文件：{exc}"
         activity = activity_snapshot(detail, run=selected_run, limit=5)
         # Filesystem sampling and its per-scope speed cache stay off the UI thread.
         activity["progress"] = self.progress_tracker.snapshot(detail, run=selected_run)
@@ -402,7 +442,7 @@ class TEFlowApp(App):
         version = self._scope_version
         try:
             include_logs = self.logs_visible and self.query_one("#logs", LiveLog).following
-            snapshot = await asyncio.to_thread(self._snapshot, self.selected_accession, self.selected_run, self.show_internal, include_logs)
+            snapshot = await asyncio.to_thread(self._snapshot, self.selected_accession, self.selected_run, self.show_internal, include_logs, self.directory_source)
             if version != self._scope_version:
                 self.call_after_refresh(self.refresh_jobs)
                 return
@@ -434,13 +474,17 @@ class TEFlowApp(App):
         self.query_one("#batch-summary", Static).update(Text(f"批次：运行 {counts['running']} · 等待 {counts['queued']} · 完成 {counts['succeeded']} · 失败 {counts['failed']}"))
 
     def _show_projects(self, jobs: list[dict], listings: dict) -> None:
-        signature = tuple((job["accession"], value(job.get("status")), tuple(listings[job["accession"]].runs), tuple(str(file.path) for file in listings[job["accession"]].files)) for job in jobs)
+        signature = (self.directory_source, tuple((job["accession"], value(job.get("status")), tuple(listings[job["accession"]].runs), tuple(str(file.path) for file in listings[job["accession"]].files)) for job in jobs))
         if signature == self._tree_signature:
             return
         tree = self.query_one("#projects", Tree)
         old_cursor = tree.cursor_node.data if tree.cursor_node else None
         expanded = {key for key, node in self._project_nodes.items() if node.is_expanded}
         scroll = (tree.scroll_x, tree.scroll_y)
+        if self._pending_directory_tree is not None:
+            state = self._pending_directory_tree
+            old_cursor, expanded, scroll = state["cursor"], state["expanded"], state["scroll"]
+            self._pending_directory_tree = None
         first = not self._project_nodes
         self._tree_signature = signature
         tree.clear()
@@ -459,9 +503,13 @@ class TEFlowApp(App):
                 key = ("file", accession, None, str(file.path))
                 self._project_nodes[key] = node.add_leaf(Text(file.name), data=key)
         target = self._project_nodes.get(old_cursor) or self._project_nodes.get(("run" if self.selected_run else "project", self.selected_accession, self.selected_run, None))
-        if target:
-            tree.move_cursor(target)
-        self.call_after_refresh(lambda: tree.scroll_to(x=scroll[0], y=scroll[1], animate=False))
+        def restore_project_cursor() -> None:
+            if self._tree_signature != signature:
+                return
+            if target:
+                tree.move_cursor(target)
+            tree.scroll_to(x=scroll[0], y=scroll[1], animate=False)
+        self.call_after_refresh(restore_project_cursor)
 
     def _show_overview(self, job: dict) -> None:
         title = f"{job['accession']} · {status_label(job)}" + (f" · 查看 {self.selected_run}" if self.selected_run else "")
@@ -487,20 +535,35 @@ class TEFlowApp(App):
         return str(size)
 
     def _show_files(self, files: list, listing) -> None:
-        self.query_one("#files-title", Static).update(Text(f"结果 · {self.selected_run or self.selected_accession}"))
-        signature = tuple((str(file.path), file.size, file.modified_ns) for file in files)
+        self.query_one("#files-title", Static).update(Text(f"{'输入' if self.directory_source == 'input' else '结果'} · {self.selected_run or self.selected_accession}"))
+        signature = (self.directory_source, tuple((str(file.path), file.size, file.modified_ns) for file in files))
         self._files = {str(file.path): file for file in files}
         empty = self.query_one("#files-empty", Static)
-        empty.update(Text(str(getattr(listing, "error", "") or "尚未生成结果文件") if not files else ""))
+        empty.update(Text(str(getattr(listing, "error", "") or ("尚无输入文件" if self.directory_source == "input" else "尚未生成结果文件")) if not files else ""))
         empty.display = not bool(files)
         if signature == self._file_signature:
             return
         self._file_signature = signature
         tree = self.query_one("#files", ResultFileTree)
         first = not tree.file_nodes
-        tree.update_files(files, scope_key=(self.selected_accession, self.selected_run))
+        tree.update_files(files, scope_key=(self.directory_source, self.selected_accession, self.selected_run))
         if first and self.selected_file is not None:
             tree.select_path(self.selected_file)
+        if self._pending_directory_view is not None:
+            state, self._pending_directory_view = self._pending_directory_view, None
+            for key in state["expanded"]:
+                if node := tree.directory_nodes.get(key):
+                    node.expand()
+            cursor = state["cursor"]
+            if cursor is not None:
+                target = (tree.file_nodes if cursor.kind == "file" else tree.directory_nodes).get(cursor.key)
+                if target is not None:
+                    self.call_after_refresh(lambda: tree.move_cursor(target))
+            x, y = state["scroll"]
+            self.call_after_refresh(lambda: tree.scroll_to(x=x, y=y, animate=False))
+            if state["path"] is not None and str(state["path"]) in self._files:
+                self.selected_file, self.preview_page = state["path"], state["page"]
+                self._pending_preview_view = state
 
     def _show_activity(self, job: dict, activity: dict | None) -> None:
         self._last_activity = job, activity
@@ -614,7 +677,7 @@ class TEFlowApp(App):
         table.display = False
         text = self.query_one("#preview-text", SelectablePreview)
         text.display = True
-        text.set_page("选择项目 / Run，再选择结果文件。")
+        text.set_page("选择项目 / Run，再选择输入文件。" if self.directory_source == "input" else "选择项目 / Run，再选择结果文件。")
         self._preview_copy_text = ""
         self.query_one("#copy-page", Button).disabled = True
         self.query_one("#previous-page", Button).disabled = True
@@ -648,7 +711,7 @@ class TEFlowApp(App):
         if not job:
             return
         try:
-            result = await asyncio.to_thread(self.browser.preview, job, path, page=page)
+            result = await asyncio.to_thread(self.browser.preview, job, path, page=page, source=self.directory_source)
             if scope != self._scope_version or path != self.selected_file or page != self.preview_page or result.signature == self._preview_signature:
                 return
             same_page = self._preview_display == (path, result.page, result.kind)
@@ -670,6 +733,18 @@ class TEFlowApp(App):
                 text.set_page(result.text or "文件为空。", copy_text=result.text, preserve_view=same_page)
             self.query_one("#copy-page", Button).disabled = False
             self._preview_display = (path, result.page, result.kind)
+            if self._pending_preview_view is not None:
+                state, self._pending_preview_view = self._pending_preview_view, None
+                if state["path"] == path and state["page"] == result.page:
+                    preview = table if result.kind == "table" else text
+                    def bound(location):
+                        row, column = location
+                        row = max(0, min(row, preview.document.line_count - 1))
+                        return row, max(0, min(column, len(preview.document.get_line(row))))
+                    selection = state["preview_selection"]
+                    preview.selection = type(selection)(bound(selection.start), bound(selection.end))
+                    x, y = state["preview_scroll"]
+                    self.call_after_refresh(lambda: preview.scroll_to(x=x, y=y, animate=False))
         except Exception as exc:
             if scope == self._scope_version and path == self.selected_file:
                 text = self.query_one("#preview-text", SelectablePreview)

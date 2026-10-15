@@ -109,8 +109,22 @@ def _size(value):
 
 def _files_from_row(run: str, row: dict):
     row = row if isinstance(row, dict) else {}
+    layout = str(row.get("library_layout", row.get("LibraryLayout", ""))).strip().upper()
     links = str(row.get("fastq_ftp") or "").split(";")
     sizes = str(row.get("fastq_bytes") or "").split(";")
+    if layout == "SINGLE":
+        links = [link.strip() for link in links if link.strip()]
+        if not links:
+            return [(f"{run}.fastq.gz", None, "sra-converted")]
+        if len(links) != 1:
+            return []
+        try:
+            name = Path(unquote(urlsplit(links[0] if "://" in links[0] else "https://" + links[0]).path)).name
+        except ValueError:
+            return []
+        return [(name, _size(sizes[0]), "ena-fastq")] if FASTQ.fullmatch(name) else []
+    if layout != "PAIRED":
+        return []
     selected = {}
     for index, link in enumerate(links):
         try:
@@ -169,6 +183,8 @@ def _parse_plan(job: dict, raw: Path, output: Path) -> _Plan:
                      for item in supplied if isinstance(item, dict)]
         else:
             names = _files_from_row(run, record.get("row", record))
+        if not names:
+            complete = False
         for name, expected, source_kind in names:
             if not isinstance(name, str) or not FASTQ.fullmatch(name) or Path(name).name != name:
                 complete = False

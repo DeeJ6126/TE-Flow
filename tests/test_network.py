@@ -142,3 +142,23 @@ def test_corrupt_deflate_cache_is_left_for_downloader_validation(tmp_path, monke
             raise zlib.error("Error -3 while decompressing data: invalid distance too far back")
     monkeypatch.setattr(network.gzip, "open", lambda *args, **kwargs: CorruptGzip())
     assert network._cached_pair_ready("SRR1", row, tmp_path) is False
+
+
+def test_complete_single_metadata_cache_skips_network_and_missing_read_requires_host(tmp_path):
+    path = tmp_path / "SRR1.fastq.gz"
+    with gzip.open(path, "wb") as handle:
+        handle.write(b"@read\nACGT\n+\nIIII\n")
+    row = {"run_accession": "SRR1", "library_layout": "SINGLE",
+           "fastq_ftp": "ftp.sra.ebi.ac.uk/" + path.name, "fastq_bytes": str(path.stat().st_size)}
+    metadata = tmp_path / "SRR1.metadata.tsv"
+    with metadata.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row), delimiter="\t")
+        writer.writeheader()
+        writer.writerow(row)
+    (tmp_path / ".teflow-SRR1.metadata.complete.json").write_text(json.dumps({
+        "accession": "SRR1", "bytes": metadata.stat().st_size, "runs": ["SRR1"],
+        "run_set_verification": {"version": 1}}))
+    (tmp_path / "success.log").write_text("2026 SRR1\n")
+    assert network.requirements_for_job("SRR1", tmp_path) == []
+    path.unlink()
+    assert network.requirements_for_job("SRR1", tmp_path) == [("https://ftp.sra.ebi.ac.uk/SRR1.fastq.gz",)]

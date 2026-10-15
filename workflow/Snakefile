@@ -1,4 +1,4 @@
-"""Accession → iSeq paired FASTQ → fastp → STAR → TEcount → merged.count.
+"""Accession → iSeq SINGLE/PAIRED FASTQ → fastp → STAR → TEcount → merged.count.
 
 Run with --directory JOB_DIR --configfile JOB_DIR/config.yaml.  Reference files
 are supplied by the existing project; this workflow never builds an index.
@@ -46,11 +46,33 @@ def samples_manifest(wildcards):
     return document
 
 
-def raw_pair(wildcards, mate):
+def raw_pair(wildcards, mate, required_layout):
     samples = samples_manifest(wildcards)["samples"]
     if wildcards.sample not in samples:
         raise ValueError(f"样本清单中没有 {wildcards.sample}。")
+    if sample_layout(wildcards) != required_layout:
+        raise ValueError(f"{wildcards.sample}: 当前 Run 不属于 {required_layout} 分支。")
     return samples[wildcards.sample][mate]
+
+
+def sample_layout(wildcards):
+    sample = samples_manifest(wildcards)["samples"][wildcards.sample]
+    # Manifests written before layout support contain the paired r1/r2 fields.
+    layout = sample.get("library_layout", "PAIRED" if sample.get("r1") and sample.get("r2") else "")
+    if layout not in {"SINGLE", "PAIRED"}:
+        raise ValueError(f"{wildcards.sample}: 样本清单缺少有效的单双端类型。")
+    if layout == "SINGLE" and sample.get("r2"):
+        raise ValueError(f"{wildcards.sample}: SINGLE 样本不能包含 R2。")
+    return layout
+
+
+def cleaned_reads(wildcards):
+    directory = QC_DIR.format(sample=wildcards.sample)
+    first = os.path.join(directory, f"{wildcards.sample}_clean_R1.fq.gz")
+    if sample_layout(wildcards) == "PAIRED":
+        return [first, os.path.join(directory, f"{wildcards.sample}_clean_R2.fq.gz")]
+    else:
+        return [first]
 
 
 def count_tables(wildcards):
@@ -88,8 +110,8 @@ checkpoint prepare_samples:
 
 rule quality_control:
     input:
-        R1_raw=lambda wildcards: raw_pair(wildcards, "r1"),
-        R2_raw=lambda wildcards: raw_pair(wildcards, "r2")
+        R1_raw=lambda wildcards: raw_pair(wildcards, "r1", "PAIRED"),
+        R2_raw=lambda wildcards: raw_pair(wildcards, "r2", "PAIRED")
     output:
         R1_clean=os.path.join(QC_DIR, "{sample}_clean_R1.fq.gz"),
         R2_clean=os.path.join(QC_DIR, "{sample}_clean_R2.fq.gz"),
@@ -107,10 +129,27 @@ rule quality_control:
         "-o {output.R1_clean:q} -O {output.R2_clean:q} > {log:q} 2>&1"
 
 
+rule quality_control_single:
+    input:
+        R1_raw=lambda wildcards: raw_pair(wildcards, "r1", "SINGLE")
+    output:
+        R1_clean=os.path.join(QC_DIR, "{sample}_clean_R1.fq.gz"),
+        html=os.path.join(QC_DIR, "{sample}.html"),
+        json=os.path.join(QC_DIR, "{sample}.json")
+    threads:
+        min(THREADS, 16)
+    resources:
+        mem_mb=4000
+    log:
+        os.path.join(LOG_DIR, "{sample}.fastp.log")
+    shell:
+        "fastp -w {threads} -h {output.html:q} -j {output.json:q} "
+        "-i {input.R1_raw:q} -o {output.R1_clean:q} > {log:q} 2>&1"
+
+
 rule star_align:
     input:
-        R1=os.path.join(QC_DIR, "{sample}_clean_R1.fq.gz"),
-        R2=os.path.join(QC_DIR, "{sample}_clean_R2.fq.gz"),
+        reads=cleaned_reads,
         index=INDEX_FILES
     output:
         bam=os.path.join(ALIGN_DIR, "{sample}Aligned.sortedByCoord.out.bam")
@@ -126,7 +165,7 @@ rule star_align:
         os.path.join(LOG_DIR, "{sample}.STAR.log")
     shell:
         "STAR --genomeDir {params.genome:q} --runThreadN {threads} "
-        "--readFilesIn {input.R1:q} {input.R2:q} --readFilesCommand zcat "
+        "--readFilesIn {input.reads:q} --readFilesCommand zcat "
         "--outFileNamePrefix {params.prefix:q} "
         "--outFilterMultimapNmax 100 --winAnchorMultimapNmax 100 "
         "--outMultimapperOrder Random --outSAMmultNmax -1 "

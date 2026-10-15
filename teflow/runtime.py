@@ -141,7 +141,11 @@ def raw_manifest_valid(job: dict) -> bool:
             return False
         for sample in document["samples"].values():
             expected = {item["name"]: item.get("bytes") for item in sample.get("files", [])}
-            for mate in ("r1", "r2"):
+            # Existing manifests predate layout and always contain both mates.
+            layout = sample.get("library_layout", "PAIRED" if sample.get("r1") and sample.get("r2") else "")
+            if layout not in {"SINGLE", "PAIRED"} or (layout == "SINGLE" and sample.get("r2")):
+                return False
+            for mate in (("r1", "r2") if layout == "PAIRED" else ("r1",)):
                 path = Path(sample[mate])
                 if not path.is_file() or not path.stat().st_size:
                     return False
@@ -576,7 +580,7 @@ def run_worker(settings_path: str, accession: str) -> int:
                    "--configfile", str(output / "config.yaml"), "--cores", str(job.get("cores", manager.settings["threads"])),
                    "--resources", "star_slots=1", "download_slots=1",
                    f"mem_mb={job.get('mem_mb', manager.settings['mem_mb'])}", "--rerun-incomplete", "--printshellcmds"]
-        rule_steps = {"quality_control": "质控", "star_align": "比对", "te_count": "计数"}
+        rule_steps = {"quality_control": "质控", "quality_control_single": "质控", "star_align": "比对", "te_count": "计数"}
         process = subprocess.Popen(command, cwd=manager.app_dir, env=environment, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
                                    start_new_session=True)
