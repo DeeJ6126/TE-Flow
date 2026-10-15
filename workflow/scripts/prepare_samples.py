@@ -11,15 +11,20 @@ import os
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
+import zlib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+from teflow.failures import KnownFailure, known_failure, website_failure
 
 ACCESSION_PATTERN = re.compile(
     r"(?:[SED]R[APXS]\d+|[SED]RR\d+|PRJ[END][A-Z]\d+|SAM[END][A-Z]?\d+|GSE\d+|GSM\d+)"
@@ -115,6 +120,9 @@ def paired_files(row: dict, run: str) -> list[dict]:
     """Select R1/R2 by metadata names; never infer samples from directory contents."""
     layout = str(row.get("library_layout", row.get("LibraryLayout", ""))).strip().upper()
     if layout != "PAIRED":
+        if layout == "SINGLE":
+            raise KnownFailure("single_end", f"{run} 是单端数据，当前分析流程要求双端数据。",
+                               detail=f"{run}: 当前分析模板需要双端 PAIRED 数据，实际 layout=SINGLE。", run=run)
         raise ValueError(f"{run}: 当前分析模板需要双端 PAIRED 数据，实际 layout={layout or '未知'}。")
     links = [link.strip() for link in str(row.get("fastq_ftp", "")).split(";") if link.strip()]
     if not links:
@@ -183,8 +191,13 @@ def parse_metadata(path: Path, allow_duplicate_names=False) -> tuple[list[str], 
 
 def _request_text(url: str) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": "TEflow/1.0"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read().decode("utf-8-sig")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read().decode("utf-8-sig")
+    except urllib.error.HTTPError:
+        raise
+    except (urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError) as exc:
+        raise website_failure(url, exc) from exc
 
 
 def fetch_ncbi_runinfo(accession: str) -> tuple[list[str], list[dict]]:
@@ -223,6 +236,9 @@ def _metadata_request(url: str) -> str:
         except (OSError, ValueError) as exc:
             last_error = exc
             if attempt < 2:
+                explicit = known_failure(exc)
+                if explicit and explicit.failure["code"] == "website_connection":
+                    progress("metadata", step=f"连接 {explicit.failure['website']} 失败，正在重试（{attempt + 1}/2）")
                 time.sleep(attempt + 1)
     raise ValueError(f"元数据请求失败: {url}: {last_error}") from last_error
 
@@ -433,7 +449,8 @@ def validate_fastq(path: Path, expected: dict):
     if not path.is_file() or path.stat().st_size <= 0:
         raise ValueError(f"FASTQ 文件缺失或为空: {path}")
     if expected["bytes"] is not None and path.stat().st_size != expected["bytes"]:
-        raise ValueError(f"FASTQ 下载尚未完成，文件大小不符: {path}")
+        raise KnownFailure("fastq_integrity", "下载文件未通过完整性校验，自动重试后仍未成功。",
+                           detail=f"FASTQ 下载尚未完成，文件大小不符: {path}")
     try:
         with gzip.open(path, "rb") as stream:
             header, sequence, separator, quality = [stream.readline() for _ in range(4)]
@@ -446,8 +463,9 @@ def validate_fastq(path: Path, expected: dict):
             if expected["source"] == "sra-converted":
                 while stream.read(1024 * 1024):
                     pass
-    except (OSError, EOFError, ValueError) as exc:
-        raise ValueError(f"FASTQ 内容无效: {path}: {exc}") from exc
+    except (gzip.BadGzipFile, EOFError, zlib.error, ValueError) as exc:
+        raise KnownFailure("fastq_integrity", "下载文件未通过完整性校验，自动重试后仍未成功。",
+                           detail=f"FASTQ 内容无效: {path}: {exc}") from exc
 
 
 def pair_is_complete(samples_dir: Path, files: list[dict]) -> bool:
@@ -485,6 +503,7 @@ def check_space(samples_dir: Path, output_dir: Path, records: dict, multiplier: 
 def run_iseq(command: list[str], samples_dir: Path, handle, timeout=None):
     handle.write("\n$ " + " ".join(command) + "\n")
     handle.flush()
+    invocation_start = Path(handle.name).stat().st_size
     process = subprocess.Popen(command, cwd=samples_dir, stdout=handle, stderr=subprocess.STDOUT,
                                start_new_session=True)
 
@@ -496,8 +515,18 @@ def run_iseq(command: list[str], samples_dir: Path, handle, timeout=None):
         try:
             returncode = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"iSeq 元数据请求超时（{timeout}s）。请检查代理通道；详情见 {handle.name}。") from exc
+            raise RuntimeError(f"iSeq 元数据请求超时（{timeout}s）；详情见 {handle.name}。") from exc
         if returncode:
+            # Only an explicit diagnostic in this invocation proves integrity
+            # failure. Old attempts and generic nonzero exits cannot classify it.
+            with Path(handle.name).open("rb") as source:
+                source.seek(max(invocation_start, source.seek(0, os.SEEK_END) - 65536))
+                recent = source.read().decode("utf-8", errors="replace")
+            if re.search(r"(?im)^[SED]RR\d+ md5 check failed after trying \d+ times[^\r\n]*\r?$", recent):
+                run = command[command.index("-i") + 1] if "-i" in command else ""
+                scope = {"run": run} if RUN_PATTERN.fullmatch(run) else {}
+                raise KnownFailure("fastq_integrity", "下载文件未通过完整性校验，自动重试后仍未成功。",
+                                   detail=f"iSeq 退出码 {returncode}；本次下载明确报告 MD5 校验失败；详情见 {handle.name}。", **scope)
             raise RuntimeError(f"iSeq 退出码 {returncode}；详情见 {handle.name}。")
     finally:
         # iSeq is Bash and launches wget/fasterq-dump/pigz children. Killing Bash
@@ -678,6 +707,8 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
                         if files[0]["source"] == "sra-converted":
                             command.extend(["-d", "sra"])
                         run_iseq(command, run_dir, log)
+                        progress("download", total_runs=len(records), downloaded_runs=index - 1,
+                                 current_sample=run, step="校验 FASTQ")
                         if run not in logged_runs(success_log):
                             raise RuntimeError(f"{run}: iSeq 未记录成功下载。")
                         for item in files:
@@ -688,7 +719,10 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
                         last_error = exc
                         log_message(str(exc), log)
                 if last_error is not None:
-                    raise RuntimeError(f"{run}: {retries} 次下载后仍未完成；已下载数据保留，可重试。{last_error}")
+                    explicit = known_failure(last_error)
+                    if explicit:
+                        explicit.failure.setdefault("run", run)
+                    raise RuntimeError(f"{run}: {retries} 次下载后仍未完成；已下载数据保留，可重试。{last_error}") from last_error
             count_root = output_dir / run if geo else output_dir
             samples[run] = {"r1": str(run_dir / files[0]["name"]),
                             "r2": str(run_dir / files[1]["name"]),
@@ -712,9 +746,20 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
         return document
 
 
+def run_preparation(*args, **kwargs):
+    """Publish explanations only when a known error actually escapes all retries."""
+    try:
+        return prepare(*args, **kwargs)
+    except Exception as exc:
+        explicit = known_failure(exc)
+        if explicit:
+            print("[TEFLOW_FAILURE] " + json.dumps({**explicit.failure, "detail": explicit.detail}, ensure_ascii=False), flush=True)
+        raise
+
+
 if "snakemake" in globals():
-    prepare(snakemake.params.accession, Path(snakemake.params.samples_dir),
-            Path(snakemake.params.output_dir), Path(snakemake.output[0]), Path(snakemake.log[0]),
-            iseq_bin=snakemake.params.iseq_bin, threads=int(snakemake.threads),
-            retries=int(snakemake.params.retries), metadata_timeout=int(snakemake.params.metadata_timeout),
-            output_space_multiplier=float(snakemake.params.output_space_multiplier))
+    run_preparation(snakemake.params.accession, Path(snakemake.params.samples_dir),
+                    Path(snakemake.params.output_dir), Path(snakemake.output[0]), Path(snakemake.log[0]),
+                    iseq_bin=snakemake.params.iseq_bin, threads=int(snakemake.threads),
+                    retries=int(snakemake.params.retries), metadata_timeout=int(snakemake.params.metadata_timeout),
+                    output_space_multiplier=float(snakemake.params.output_space_multiplier))

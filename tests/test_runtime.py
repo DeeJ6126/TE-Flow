@@ -13,6 +13,7 @@ from teflow.runtime import JobManager, effective_config, normalize_accession, sc
 
 @pytest.fixture
 def manager(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime, "check_network", lambda *args, **kwargs: None)
     template = tmp_path / "templates"
     template.mkdir()
     reference = tmp_path / "index"

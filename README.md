@@ -1,12 +1,12 @@
-# TEflow 2.2
+# TEflow 2.3
 
 源码仓库：[DeeJ6126/TE-Flow](https://github.com/DeeJ6126/TE-Flow)（Private）。作者：DeeJ6126。
 
 部署在 **213 服务器的 /root/teflow**。CLI 和 TUI 共用一个持久化队列、自动资源调度器和 Snakemake 分析流程。
 
-当前版本为 **2.2.1**。已确认、尚未实施的体验改进见 [ROADMAP.md](ROADMAP.md)。仓库保存代码、环境定义和文档；原始数据、参考 index、运行状态、日志、验证产物和访问凭据保留在服务器本地。
+当前版本为 **2.3.0**。仓库保存代码、环境定义和使用文档；原始数据、参考 index、运行状态、日志、验证产物和访问凭据保留在服务器本地。
 
-本轮完成需求 1、2、3、5。需求 4（单细胞）保留待补充。当前分析模板适用于人类双端 bulk RNA-seq。
+当前分析模板适用于人类双端 bulk RNA-seq，单细胞入口保留待补充。
 
 ## 在服务器上运行
 
@@ -28,6 +28,8 @@ tf
 - 中间始终显示当前 GSE/SRR 的结果目录树；多文件目录默认折叠，点击或回车展开。只有一个文件的目录直接显示为路径，例如 abundance/SRR22521672.cntTable。选择文件后，在右下方预览。刷新保留展开状态、选中位置和滚动位置。
 - 区域之间的横线、竖线可按住鼠标拖动，调整相邻区域大小；顶部输入区保持固定。布局自动保存在 state/ui-layout.json，重新打开沿用，并根据终端尺寸限制最小宽高。
 - 右上方显示当前范围的精简实时输出：当前步骤、已知运行耗时和最近关键事件。查看某个 SRR 时，上方主线仍显示整个 GSE 的进度。
+- CLI 和 TUI 共用实时进度：下载显示实际字节数、总量、百分比、最近几秒平均速度和预计剩余时间；速度自动采用 B/s、KB/s、MB/s、GB/s，保留两位小数。大小未知时显示未知总量；文件下载齐全、仍在校验时显示“校验中”。分析阶段显示已完成 Run 数和耗时，不估造连续百分比。
+- 使用 SRA 备用来源时，显示当前 Run 的 SRA 包下载量和速度；转换、压缩时显示“转换 FASTQ”和耗时。压缩后的总大小尚未知时不显示百分比，确认完成后显示实际最终大小。
 - 右下方顶部是“文件预览 / 运行日志”页签。F2 切换，点击文件自动回到预览；切换到日志时文件列表保留。
 - 表格和文本按页读取，每页最多 100 行。上一页/下一页切换页面；刷新与页签切换保留当前页和滚动位置。超宽表最多预览 60 列，过长内容会明确提示截断，完整数据保存在原文件中。
 - 文件预览支持鼠标拖选文字和 Ctrl+C；“复制本页”复制当前页，表格输出带表头的 TSV。预览只读。复制通过终端 OSC 52 发送至本机剪贴板，需要 SSH 终端允许剪贴板写入；复制后不弹出提示窗口。退出界面仍使用 Ctrl+Q。
@@ -51,13 +53,13 @@ tf -f /root/geo_ids.txt -t bulk
 
 ```bash
 # 单项目
-/root/teflow/launch.sh run GSE219739 -t bulk
+tf -a GSE219739 -t bulk
 
 # 多项目，逗号分隔
-/root/teflow/launch.sh run GSE219739,GSE113777 -t bulk
+tf -a GSE219739,GSE113777 -t bulk
 
 # 从服务器绝对路径读取批量清单
-/root/teflow/launch.sh run /root/geo_ids.txt -t bulk
+tf -f /root/geo_ids.txt -t bulk
 ```
 
 TXT 示例：
@@ -72,15 +74,19 @@ GSE113777
 终端内显示动态概览；重定向到文件时只输出阶段、进度和状态变化。需要工具细节时使用 --verbose：
 
 ```bash
-/root/teflow/launch.sh run /root/geo_ids.txt -t bulk --verbose
-/root/teflow/launch.sh status
-/root/teflow/launch.sh status GSE219739
-/root/teflow/launch.sh logs GSE219739
+tf -f /root/geo_ids.txt -t bulk --verbose
+tf status
+tf status GSE219739
+tf logs GSE219739
 ```
 
-若已激活 TE 环境，上述 launch.sh 后的参数也可直接用于 teflow，例如 teflow run GSE219739 -t bulk。维护入口同样明确类型：teflow submit GSE219739 -t bulk；status/logs 查询不需要类型。
+`tf status [编号]` 以 JSON 查看全部或单个任务，`tf logs <编号>` 显示详细日志；这两个查询不需要指定类型。只提交后立即返回可以用 `tf submit GSE219739 -t bulk`。`tf run <编号或TXT路径> -t bulk` 也可用于完整形式的批量提交。
 
 CLI 退出码：全部成功 0；有项目失败/中断 1；输入或配置错误 2；Ctrl+C 退出查看 130。重复输入正在运行的编号会查看现有任务，已完成且文件完整时直接复用结果；失败项目可再次输入恢复。
+
+新任务在确实需要联网时会做一次轻量网站检查，整批并行检查的总等待预算为五秒；已有任务复用、已有完整原始数据的本地分析不要求联网。某个来源失败时会尝试可用备用来源。运行中的实际请求仍会单独报告连接失败，例如“无法连接 NCBI GEO（www.ncbi.nlm.nih.gov）”。
+
+对于明确的单端/双端不匹配、网站连接失败、下载完整性校验重试耗尽，界面补充简短原因；原始错误仍保存在日志。未知错误继续显示现有失败状态、原始报错及日志入口。
 
 ## GEO 的解析和目录
 
@@ -148,7 +154,7 @@ setup/create-te.sh 用于重建环境，已经配置好的服务器直接使用�
 
 ## 实施与验证记录
 
-详见 IMPLEMENTATION_PLAN.md 和 verification/v2/。测试包括真实 Linux 调度器/worker 多进程、资源排队与失败隔离、GEO 范围解析、Snakemake DAG、CLI 及 Textual Pilot。
+测试包括真实 Linux 调度器/worker 多进程、资源排队与失败隔离、GEO 范围解析、Snakemake DAG、CLI 及 Textual Pilot。详细验证产物保存在服务器的 verification/ 目录。
 
 2.0 版本验收的完整 Linux 测试 **119 项通过，另有 3 项子测试通过**。真实项目 **GSE219739** 首次运行成功：准确识别两个 Run，下载 4 个 FASTQ（共 48,129,144 字节），完成 fastp、STAR、TEcount 并输出含 **37,921 个基因/TE 特征、两个 Run 计数列**的 merged.count。逐项核对与两个输入计数表完全一致，Run 子目录没有重复合并表。
 
@@ -163,3 +169,5 @@ verification/v2/end-to-end.json 保存真实结果审计，tests.log 保存最�
 2.2 交互改造：四条可拖动分隔线、保存布局、结果目录折叠、文字选择和当前页复制，以及 CLI/TUI 统一的数据类型选择。Linux 完整回归 **183 项通过**，最终布局专项 **9 项通过**。真实数据分页与复制内容均与源文件一致；单编号、逗号批量和 TXT 的 `-t bulk` 命令已验证复用结果，已有任务的运行次数和进程未变。证据位于 verification/workspace/。剪贴板已验证 OSC52 输出，终端接收仍取决于客户端权限。
 
 2.2.1 微调：取消复制弹窗；单文件目录显示为路径，多文件目录继续折叠；横竖分隔线统一为可拖动的细线。Linux 相关交互测试 **35 项通过**，真实结果界面已检查。
+
+2.3：统一 tf 查询与运行入口，CLI/TUI 共用实际下载进度，增加有时限的网站预检和明确错误说明。Linux 完整回归 **310 项测试及 3 项子测试通过**；真实已有项目的 CLI/TUI、离线结果复用和隔离的连接失败预检均已验证，现有任务的运行次数和 worker/Snakemake 进程记录保持不变。

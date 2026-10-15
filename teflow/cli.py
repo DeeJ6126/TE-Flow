@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -15,6 +16,8 @@ from rich.table import Table
 from rich.text import Text
 
 from .data_types import DATA_TYPES, validate_data_type
+from .failures import KnownFailure, friendly_failure
+from .progress import ProgressTracker, progress_lines
 from .presentation import (
     ACTIVE, STAGES, SUCCESS, batch_summary, job_progress, job_summary,
     progress_signature, stage_label, status_label, value,
@@ -26,7 +29,7 @@ POLL_SECONDS = 1.0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="TE 工作流：GEO/SRA 到合并计数表；不带命令打开 TUI。")
+    parser = argparse.ArgumentParser(prog="tf", description="TE 工作流：GEO/SRA 到合并计数表；不带命令打开 TUI。")
     parser.add_argument("--settings", help="应用 settings.yaml 路径")
     commands = parser.add_subparsers(dest="command")
     run = commands.add_parser("run", help="批量运行并查看进度，自动按资源并行")
@@ -52,10 +55,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def shortcut_main(argv: Sequence[str] | None = None) -> int:
     """Short `tf` spelling; retain one implementation of submission and viewing."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    command_index = 0
+    while command_index < len(argv):
+        if argv[command_index] == "--settings":
+            command_index += 2
+        elif argv[command_index].startswith("--settings="):
+            command_index += 1
+        else:
+            break
+    if command_index < len(argv) and argv[command_index] in {"status", "logs", "run", "submit"}:
+        return main(argv)
     parser = argparse.ArgumentParser(
         prog="tf",
         description="TE 工作流快捷入口；不带参数打开 TUI。多个项目自动按共享资源并行。",
-        epilog="示例：tf -a GSE219739 -t bulk；tf -a GSE1,GSE2 -t bulk；tf -f /root/geo_ids.txt -t bulk",
+        epilog="示例：tf -a GSE219739 -t bulk；tf -f /root/geo_ids.txt -t bulk；tf status [编号]；tf logs <编号>",
     )
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("-a", "--accession", help="单个编号或逗号分隔的多个编号")
@@ -95,7 +109,7 @@ def _positive_integer(raw: str) -> int:
     return result
 
 
-def render_batch(jobs: list[dict]) -> Group:
+def render_batch(jobs: list[dict], progress: dict | None = None) -> Group:
     """A compact live dashboard without scientific-tool output."""
     table = Table.grid(padding=(0, 2), expand=True)
     table.add_column(no_wrap=True)
@@ -108,10 +122,14 @@ def render_batch(jobs: list[dict]) -> Group:
         table.add_row(Text(str(job["accession"]), style="bold"),
                       Text(label, style=style),
                       Text(job_progress(job) if status in ACTIVE else stage_label(job) if status not in SUCCESS else ""))
+        snapshot = (progress or {}).get(str(job["accession"]))
+        if snapshot is not None and status == "running":
+            for line in progress_lines(snapshot, width=20):
+                table.add_row("", "", Text(line, style="cyan"))
     return Group(
         Text(" → ".join(label for _, label in STAGES), style="bold cyan"),
         Text(batch_summary(jobs)), Text(), table,
-        Text("Ctrl+C 退出查看，后台任务继续。详细日志：--verbose 或 teflow logs <编号>", style="dim"),
+        Text("Ctrl+C 退出查看，后台任务继续。详细日志：--verbose 或 tf logs <编号>", style="dim"),
     )
 
 
@@ -142,7 +160,7 @@ def _print_result(console: Console, job: dict) -> None:
     if value(job.get("status")) in SUCCESS:
         console.print(Text(f"{accession} 结果：{job.get('result_path') or '未记录结果路径'}", style="green"), soft_wrap=True)
     else:
-        message = str(job.get("error") or status_label(job)).splitlines()[0]
+        message = friendly_failure(job) or str(job.get("error") or status_label(job)).splitlines()[0]
         console.print(Text(f"{accession} 错误：{message}", style="red"), soft_wrap=True)
         if job.get("job_dir"):
             console.print(Text(f"{accession} 日志：{Path(job['job_dir']) / 'run.log'}"), soft_wrap=True)
@@ -157,8 +175,12 @@ def watch_jobs(manager: JobManager, submitted: list[dict], *, verbose: bool = Fa
     signatures: dict[str, tuple] = {}
     log_tails: dict[str, str] = {}
     shown_results: set[str] = set()
+    tracker = ProgressTracker()
+    last_progress: dict[str, tuple] = {}
+    last_progress_print: dict[str, float] = {}
+    progress = {str(job["accession"]): tracker.snapshot(job) for job in jobs}
     use_live = console.is_terminal and not console.is_dumb_terminal
-    live = Live(render_batch(jobs), console=console, auto_refresh=False, transient=False) if use_live else None
+    live = Live(render_batch(jobs, progress), console=console, auto_refresh=False, transient=False) if use_live else None
     try:
         if live:
             live.start()
@@ -166,13 +188,29 @@ def watch_jobs(manager: JobManager, submitted: list[dict], *, verbose: bool = Fa
             console.print(Text("流程：" + " → ".join(label for _, label in STAGES)))
             console.print(Text(batch_summary(jobs)))
         while True:
+            progress = {str(job["accession"]): tracker.snapshot(job) for job in jobs}
             if live:
-                live.update(render_batch(jobs), refresh=True)
+                live.update(render_batch(jobs, progress), refresh=True)
             for job in jobs:
                 accession = str(job["accession"])
                 signature = progress_signature(job)
-                if not live and signatures.get(accession) != signature:
-                    console.print(Text(job_summary(job)), soft_wrap=True)
+                snapshot = progress[accession]
+                metric_key = (snapshot.stage, snapshot.label, snapshot.current_bytes, snapshot.total_bytes,
+                              snapshot.completed_runs, snapshot.total_runs,
+                              None if snapshot.speed_bps is None else snapshot.speed_bps > 0)
+                changed = signatures.get(accession) != signature
+                tick = time.monotonic()
+                if not live:
+                    if changed:
+                        console.print(Text(job_summary(job)), soft_wrap=True)
+                    moving = (value(job.get("status")) == "running"
+                              and metric_key != last_progress.get(accession)
+                              and tick - last_progress_print.get(accession, float('-inf')) >= 5)
+                    if value(job.get("status")) == "running" and (changed or moving):
+                        for line in progress_lines(snapshot, width=20):
+                            console.print(Text(f"{accession} · {line}"), soft_wrap=True)
+                        last_progress[accession] = metric_key
+                        last_progress_print[accession] = tick
                 signatures[accession] = signature
                 if verbose:
                     tail = manager.log_tail(accession, lines=100)
@@ -191,7 +229,7 @@ def watch_jobs(manager: JobManager, submitted: list[dict], *, verbose: bool = Fa
         if live:
             live.stop()
             live = None
-        console.print(Text("已退出进度查看，后台任务继续运行。可用 teflow status 或重新打开 TUI 查看。", style="yellow"))
+        console.print(Text("已退出进度查看，后台任务继续运行。可用 tf status 或重新输入 tf 打开 TUI 查看。", style="yellow"))
         return 130
     finally:
         if live:
@@ -224,6 +262,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             from .tui import TEFlowApp
             TEFlowApp(manager=manager).run()
         return 0
+    except KnownFailure as exc:
+        Console(stderr=True).print(Text(str(exc), style="red"))
+        if getattr(args, "verbose", False) and exc.detail != str(exc):
+            Console(stderr=True).print(Text(exc.detail, style="dim"))
+        return 1
     except (ValueError, OSError) as exc:
         Console(stderr=True).print(Text(f"输入或配置错误：{exc}", style="red"))
         return 2

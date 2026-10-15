@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,8 @@ import yaml
 
 from .data_types import validate_data_type
 from .inputs import normalize_accession, parse_inputs
+from .failures import known_failure, valid_failure
+from .network import check_network, requirements_for_job
 from .resources import available_capacity, detect_budget
 
 try:
@@ -300,6 +303,31 @@ class JobManager:
         for accession in accessions:
             if (Path(self.settings["output_root"]) / accession).resolve() == Path(self.settings["template_dir"]).resolve():
                 raise ValueError("该编号与模板目录同名，请使用真实测序编号。")
+        # The bounded network check must never hold the shared registry lock:
+        # viewers and running workers continue updating during a slow request.
+        network_accessions, groups = [], []
+        with self._lock():
+            snapshot = self._load()
+            if self._refresh(snapshot):
+                self._save(snapshot)
+            for accession in accessions:
+                old = snapshot["jobs"].get(accession)
+                if old and old["data_type"] != data_type:
+                    raise ValueError(f"{accession} 已记录为 {old['data_type']} 类型，无法按 {data_type} 提交。")
+                if old and old["status"] in ACTIVE:
+                    continue
+                local = old or {"accession": accession,
+                                "job_dir": str(Path(self.settings["output_root"]) / accession)}
+                if raw_manifest_valid(local):
+                    continue
+                network_accessions.append(accession)
+                for group in requirements_for_job(accession, Path(self.settings["raw_root"]) / accession):
+                    if group not in groups:
+                        groups.append(group)
+        if network_accessions and groups:
+            check_network(network_accessions, worker_environment(self.settings), timeout=5.0, groups=groups)
+        # Reload after preflight: another submitter may have queued these same
+        # accessions while we checked websites. The existing reuse rules apply.
         with self._lock():
             registry = self._load()
             self._refresh(registry)
@@ -525,13 +553,16 @@ def run_worker(settings_path: str, accession: str) -> int:
     process = None
     activity = ActivityRecorder(job, output / ".teflow-activity.jsonl")
     activity.begin()
+    reported_failure = None
+    reported_detail = ""
     previous_term = signal.getsignal(signal.SIGTERM)
     def interrupted(signum, frame):
         raise InterruptedError(f"任务被信号 {signum} 中断，可重新提交恢复。")
     signal.signal(signal.SIGTERM, interrupted)
     try:
         validate_data_type(job.get("data_type", "bulk"))
-        manager.update(accession, status="running", stage="metadata", step="解析项目", error="")
+        manager.update(accession, status="running", stage="metadata", step="解析项目", error="",
+                       failure=None, error_detail="")
         for program in ("iseq", "snakemake", "fastp", "STAR", "TEcount", "zcat"):
             if not shutil.which(program, path=environment["PATH"]):
                 raise RuntimeError(f"TE 环境缺少 {program}。")
@@ -556,6 +587,16 @@ def run_worker(settings_path: str, accession: str) -> int:
                 log.write(line)
                 log.flush()
                 activity.feed(line)
+                failure_event = re.search(r"\[TEFLOW_FAILURE\]\s*(\{.*\})", line)
+                if failure_event:
+                    try:
+                        payload = json.loads(failure_event.group(1))
+                        explicit = valid_failure(payload)
+                        if explicit:
+                            reported_failure = explicit
+                            reported_detail = str(payload.get("detail", ""))[:16000]
+                    except (ValueError, TypeError):
+                        pass
                 event = re.search(r"\[TEFLOW_PROGRESS\]\s*(\{.*\})", line)
                 if event:
                     try:
@@ -590,7 +631,16 @@ def run_worker(settings_path: str, accession: str) -> int:
         if process and process.poll() is None:
             with contextlib.suppress(Exception):
                 terminate_owned_process(process)
-        manager.update(accession, status="failed", exit_code=1, error=str(error), finished_at=timestamp())
+        explanation = known_failure(error)
+        failure = explanation.failure if explanation else reported_failure
+        values = {"status": "failed", "exit_code": 1, "error": str(error), "finished_at": timestamp()}
+        if failure:
+            values.update(failure=failure, error_detail=explanation.detail if explanation else
+                          (reported_detail or str(error)))
+        manager.update(accession, **values)
+        with contextlib.suppress(OSError):
+            with (output / "run.log").open("a", encoding="utf-8") as log:
+                traceback.print_exc(file=log)
         activity.finish("failed", str(error))
         print(str(error), file=sys.stderr, flush=True)
         return 1

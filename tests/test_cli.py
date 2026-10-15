@@ -280,3 +280,47 @@ def test_invalid_type_or_type_without_source_rejected_before_runtime(entry, argu
     with pytest.raises(SystemExit) as error:
         entry(arguments)
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize("arguments", [
+    ["status"], ["status", "SRR1"], ["logs", "SRR1"],
+    ["--settings", "/root/custom.yaml", "status", "SRR1"],
+    ["--settings=/root/custom.yaml", "logs", "SRR1"],
+])
+def test_tf_maintenance_dispatch_keeps_settings_and_needs_no_type(arguments, monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli, "main", lambda argv: calls.append(argv) or 0)
+    assert cli.shortcut_main(arguments) == 0
+    assert calls == [arguments]
+
+
+def test_tf_status_and_logs_use_real_command_parser(monkeypatch, capsys):
+    manager = FakeManager([job(status="succeeded")])
+    manager.list_jobs = lambda: manager.initial
+    manager.get_job = lambda accession: job(accession)
+    monkeypatch.setattr(cli, "JobManager", lambda _: manager)
+    assert cli.shortcut_main(["status"]) == 0
+    assert '"accession": "GSE113777"' in capsys.readouterr().out
+    assert cli.shortcut_main(["status", "SRR1"]) == 0
+    assert '"accession": "SRR1"' in capsys.readouterr().out
+    assert cli.shortcut_main(["logs", "SRR1"]) == 0
+    assert "tool noise SRR1" in capsys.readouterr().out
+
+
+def test_tf_subcommand_help_identifies_tf(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "JobManager", lambda _: pytest.fail("help reached runtime"))
+    with pytest.raises(SystemExit) as error:
+        cli.shortcut_main(["status", "--help"])
+    assert error.value.code == 0
+    assert "usage: tf status" in capsys.readouterr().out
+
+
+def test_cli_hints_use_tf_after_ctrl_c(monkeypatch):
+    manager = FakeManager([job(status="running", stage="download")])
+    def interrupt(*args):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(cli.time, "sleep", interrupt)
+    console, stream = output_console()
+    assert cli.watch_jobs(manager, manager.initial, console=console) == 130
+    assert "tf status" in stream.getvalue()
+    assert "teflow status" not in stream.getvalue()

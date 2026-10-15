@@ -59,7 +59,7 @@ snakemake-interface-storage-plugins==4.4.1
 SQLAlchemy==2.0.36
 sqlmodel==0.0.37
 tabulate==0.10.0
-# Editable install with no version control (teflow==2.2.1)
+# Editable install (teflow==2.3.0)
 -e /root/teflow
 tenacity==9.2.1
 TEtranscripts==2.2.4

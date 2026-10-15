@@ -141,6 +141,7 @@ def _cleanup_test_processes(registry_path: Path, settings_path: Path,
 
 def test_real_detached_scheduler_parallel_budget_and_failure_release(tmp_path, monkeypatch):
     """Two actual workers overlap; a third waits and starts after failed work frees a slot."""
+    monkeypatch.setattr(runtime, "check_network", lambda *args, **kwargs: None)
     environment = tmp_path / "synthetic-env"
     binary_dir = environment / "bin"
     binary_dir.mkdir(parents=True)

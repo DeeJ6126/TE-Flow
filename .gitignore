@@ -12,3 +12,6 @@ setup/bin/
 .env.*
 !.env.example
 .git-credentials
+plan/
+ROADMAP.md
+IMPLEMENTATION_PLAN.md

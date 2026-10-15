@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.text import Text
+from rich.cells import cell_len
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -15,8 +17,10 @@ from textual.message import Message
 from textual.widgets import Button, Footer, Header, Input, RichLog, Select, Static, TabbedContent, TabPane, Tree
 
 from .activity import activity_snapshot, log_snapshot
+from .failures import friendly_failure
 from .layout import Splitter, WorkspaceLayout, clamp
 from .presentation import batch_counts, job_progress, stage_track, status_label, value
+from .progress import ProgressTracker, format_duration, format_speed, progress_lines
 from .results import ResultBrowser
 from .result_tree import ResultFileTree
 from .preview_widgets import SelectablePreview
@@ -125,6 +129,7 @@ class TEFlowApp(App):
             from .runtime import JobManager
             manager = JobManager(settings_path=settings_path)
         self.manager, self.browser = manager, ResultBrowser()
+        self.progress_tracker = ProgressTracker()
         state_dir = getattr(manager, "state_dir", None)
         self.layout_path = Path(layout_path) if layout_path is not None else Path(state_dir) / "ui-layout.json" if state_dir else None
         self.workspace_layout = WorkspaceLayout.load(self.layout_path)
@@ -195,9 +200,11 @@ class TEFlowApp(App):
 
     def on_mount(self) -> None:
         self.query_one("#projects", Tree).show_root = False
+        self._clear_preview()
         self.query_one("#accession", Input).focus()
         self.screen.set_class(self.size.width < 110 or self.size.height < 30, "compact")
         self.call_after_refresh(self._apply_layout)
+        self.set_timer(0.05, self._apply_layout)
         self.set_interval(1.0, self.refresh_jobs)
         self.refresh_jobs()
 
@@ -206,10 +213,12 @@ class TEFlowApp(App):
         self.call_after_refresh(self._apply_layout)
 
     def _apply_layout(self) -> None:
-        if not self.is_mounted:
+        if not self.query("#workspace") or not self.query("#body"):
             return
         body, workspace = self.query_one("#body"), self.query_one("#workspace")
-        if workspace.size.width < 5:
+        if workspace.content_size.width < 5 or body.content_size.height < 1:
+            if self.is_running:
+                self.set_timer(0.05, self._apply_layout)
             return
         history, files, _ = self.workspace_layout.columns(workspace.content_size.width)
         self.query_one("#history-panel").styles.width = history
@@ -251,6 +260,7 @@ class TEFlowApp(App):
 
     def _feedback(self, message: str, *, error: bool = False) -> None:
         widget = self.query_one("#feedback", Static)
+        widget.tooltip = None
         widget.update(Text(message))
         widget.set_class(error, "error")
 
@@ -304,6 +314,8 @@ class TEFlowApp(App):
             self._feedback(f"{len(jobs)} 个项目已完成，显示已有结果。" if completed else f"已提交 {len(jobs)} 个项目；退出界面后任务继续。")
         except Exception as exc:
             self._feedback(str(exc), error=True)
+            if getattr(exc, "detail", None):
+                self.query_one("#feedback", Static).tooltip = Text(str(exc.detail))
         finally:
             self._submitting = False
             if self.is_running:
@@ -377,6 +389,8 @@ class TEFlowApp(App):
             files = []
             listings[selected].error = f"无法读取结果文件：{exc}"
         activity = activity_snapshot(detail, run=selected_run, limit=5)
+        # Filesystem sampling and its per-scope speed cache stay off the UI thread.
+        activity["progress"] = self.progress_tracker.snapshot(detail, run=selected_run)
         logs = log_snapshot(detail, run=selected_run, lines=300) if include_logs else None
         return jobs, selected, detail, listings, files, activity, logs
 
@@ -453,12 +467,12 @@ class TEFlowApp(App):
         title = f"{job['accession']} · {status_label(job)}" + (f" · 查看 {self.selected_run}" if self.selected_run else "")
         compact = self.screen.has_class("compact")
         if compact:
-            title += " · " + job_progress(job)
+            title += " · " + (friendly_failure(job) or job_progress(job))
         overview = Text(title, style="bold")
         overview.append("\n")
         overview.append_text(stage_track(job))
         if not compact:
-            overview.append("\n" + job_progress(job))
+            overview.append("\n" + (friendly_failure(job) or job_progress(job)))
         overview.no_wrap = compact
         overview.overflow = "ellipsis"
         self.query_one("#overview", Static).update(overview)
@@ -493,20 +507,58 @@ class TEFlowApp(App):
         activity = activity or {}
         scope = self.selected_run or str(job["accession"])
         elapsed = activity.get("elapsed_seconds")
-        duration = f" · 已运行 {int(elapsed)//60}分{int(elapsed)%60:02d}秒" if elapsed is not None else ""
+        duration = f" · 此步骤已运行 {int(elapsed)//60}分{int(elapsed)%60:02d}秒" if elapsed is not None else ""
         activity_status = status_label({"status": activity.get("status", job.get("status"))})
         step = str(activity.get("step") or status_label(job))
         compact = self.screen.has_class("compact")
         title = f"{scope} · {activity_status} · {step}{duration}"
         if compact:
             title = f"{scope} · {step}" + (f" · {int(elapsed)//60}:{int(elapsed)%60:02d}" if elapsed is not None else "")
-        available = self.query_one("#activity", Static).size.height
+        widget = self.query_one("#activity", Static)
+        available = max(1, widget.size.height)
         tiny = available < 2
-        self.query_one("#activity-title", Static).update(Text("实时 · " + title if tiny else "实时概况 · 关键事件", no_wrap=True, overflow="ellipsis"))
-        text = Text("" if tiny else title + "\n", style="bold", no_wrap=True, overflow="ellipsis")
-        available_events = max(1, min(5, available if tiny else available - 1))
+        snapshot = activity.get("progress")
+        active = value(activity.get("status", job.get("status"))) in {"running", "queued", "pending"}
+        display_snapshot = snapshot
+        if snapshot and widget.size.width < 55 and snapshot.label.startswith("下载 SRA"):
+            display_snapshot = replace(snapshot, label="下载 SRA")
+        fixed = (cell_len(display_snapshot.label) +
+                 (14 if display_snapshot.percent is None else len(f"{display_snapshot.percent:.1f}%") + 2)) if display_snapshot else 0
+        details = progress_lines(display_snapshot, width=max(3, min(24, widget.size.width - fixed))) if snapshot and active else ()
+        reason = self._activity_failure(job, activity)
+        heading = "实时 · " + title if tiny else "实时概况 · 关键事件"
+        rows: list[tuple[str, str]] = [] if tiny else [(title, "bold")]
+        short = available <= 2
+        if short and details and snapshot.label == "转换 FASTQ":
+            heading = details[0]
+            rows = []
+        elif short and details and snapshot.stage == "download":
+            # At 80x24 the title is the second progress row, leaving the preview
+            # usable instead of growing the panel to fit additional widgets.
+            heading = (f"{snapshot.label} · 总耗时 {format_duration(snapshot.elapsed_seconds)}"
+                       if snapshot.label in {"校验中", "下载完成"}
+                       else f"{format_speed(snapshot.speed_bps)} · 剩余 {format_duration(snapshot.eta_seconds)}")
+            rows = [(line, "bold cyan" if index == 0 else "cyan") for index, line in enumerate(details[:available])]
+        elif short and details:
+            heading = details[0]
+            rows = []
+        elif details:
+            rows.extend((line, "cyan") for line in details[:max(0, available - len(rows))])
+        if reason:
+            if len(rows) >= available:
+                rows[-1] = (reason, "red")
+            else:
+                rows.append((reason, "red"))
+        title_widget = self.query_one("#activity-title", Static)
+        title_widget.update(Text(heading, no_wrap=True, overflow="ellipsis"))
+        full_details = progress_lines(snapshot, width=24) if snapshot and active else ()
+        tooltip = "\n".join([title, *full_details, *([reason] if reason else [])])
+        title_widget.tooltip = widget.tooltip = tooltip
+        available_events = max(0, min(5, available - len(rows)))
         items = (activity.get("events") or [])[-available_events:]
-        for index, event in enumerate(items):
+        if not available_events:
+            items = []
+        for event in items:
             stamp = str(event.get("time") or "")
             if stamp:
                 try:
@@ -516,12 +568,25 @@ class TEFlowApp(App):
             message, run = str(event.get("message") or ""), str(event.get("run") or "")
             if run and run not in message and not self.selected_run:
                 message = run + " · " + message
-            text.append((stamp + "  " if stamp else "") + message, style="red" if event.get("level") == "error" else "yellow" if event.get("level") == "warning" else "")
-            if index < len(items) - 1:
+            rows.append(((stamp + "  " if stamp else "") + message, "red" if event.get("level") == "error" else "yellow" if event.get("level") == "warning" else ""))
+        if not rows or (not tiny and len(rows) == 1):
+            rows.append(("等待关键事件；完整输出见运行日志。", ""))
+        text = Text(no_wrap=True, overflow="ellipsis")
+        for index, (line, style) in enumerate(rows[:available]):
+            if index:
                 text.append("\n")
-        if not items:
-            text.append("等待关键事件；完整输出见运行日志。")
-        self.query_one("#activity", Static).update(text)
+            text.append(line, style=style)
+        widget.update(text)
+
+    def _activity_failure(self, job: dict, activity: dict) -> str | None:
+        reason = friendly_failure(job)
+        if not reason or not self.selected_run:
+            return reason
+        failure_run = (job.get("failure") or {}).get("run") or job.get("current_sample")
+        # The project may fail after another Run has already completed.
+        if str(failure_run or "") != self.selected_run or value(activity.get("status")) != "failed":
+            return None
+        return reason
 
     def _show_logs(self, snapshot: dict | None) -> None:
         if snapshot is None or not self.logs_visible:
