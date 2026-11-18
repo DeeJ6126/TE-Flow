@@ -178,7 +178,7 @@ tf -f /root/te_model_selection.csv -t bulk --discard-reads -j 2 --threads 16
 
 ## 实施与验证记录
 
-2.6：新增每批并发上限 `max_parallel_jobs` / `-j` 和 `--threads` 参数名，默认值保持 2.5 行为。
+2.6：新增每批并发上限 `max_parallel_jobs` / `-j` 和 `--threads` 参数名，默认值保持 2.5 行为。2026-11-18 在 213 服务器 TE 环境完整回归 **361 项通过**（含 7 项新增的并发 / CLI 测试；TUI 测试 `test_default_output_toggle_input_and_restore_file_page` 曾偶发失败一次，单独重跑与再次全量均通过）。当前下载为 iSeq `-g -r https` 从 ENA 取 `.fastq.gz`，单连接经代理约 0.8 MB/s；NCBI SRA 的 AWS 公开地址经代理约 2.1 MB/s（`.sra`，需转换），是否切换待定。
 
 2.5：选样 CSV 改为按 GSM 合并 Run 计数；新增链方向自动判断并传给 TEcount；清理与结果复用按 GSM 进行。2026-11-18 在 213 服务器 TE 环境完整回归 **354 项通过**（含 GSM 合并的单端 / 双端 DAG、清理、复用和链方向单元测试）。链方向脚本在 4 个已有 BAM（SRR7074294、SRR7074295、SRR22521672、SRR22521673）上判为不分链，同向约 50%；对 SRR22521672 分别统计 read1、read2 也各约 48% / 52%，确认为不分链建库而非翻转错误。尚缺链特异性样本的阳性对照，正式批量的第一批应检查判定分布。旧版代码备份在 /root/teflow-backups/20261118-pre-v2.5.tar.gz，旧的未提交改动另存于 git stash。
 
