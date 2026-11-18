@@ -1,16 +1,16 @@
-# TEflow 2.4
+# TEflow 2.5
 
 源码仓库：[DeeJ6126/TE-Flow](https://github.com/DeeJ6126/TE-Flow)（Private）。作者：DeeJ6126。
 
 部署在 **213 服务器的 /root/teflow**。CLI 和 TUI 共用一个持久化队列、自动资源调度器和 Snakemake 分析流程。
 
-当前版本为 **2.4.0**。仓库保存代码、环境定义和使用文档；原始数据、参考 index、运行状态、日志、验证产物和访问凭据保留在服务器本地。
+当前版本为 **2.5.0**。仓库保存代码、环境定义和使用文档；原始数据、参考 index、运行状态、日志、验证产物和访问凭据保留在服务器本地。
 
 当前分析模板适用于人类单端或双端 bulk RNA-seq，按每个 Run 的元数据自动选择；单细胞入口保留待补充。
 
 ## 在服务器上运行
 
-使用已经登录 213 的终端，保持现有代理及反向 SSH 隧道在线。启动脚本会自动加载 TE 环境和代理设置。
+在 Linux 终端先启用已安装依赖的 TE 环境（或为启动脚本指定 `TEFLOW_PYTHON`）。运行路径由 `settings.yaml` 管理，相对路径以该文件所在目录为基准；需要借用代理时在配置里填写 `proxy_env`，并启动对应的转发。
 
 **打开 TUI：**
 
@@ -49,7 +49,7 @@ tf -a GSE219739,GSE113777 -t bulk
 tf -f /root/geo_ids.txt -t bulk
 ```
 
-`-a / --accession` 传入编号，`-f / --file` 传入服务器 TXT 的绝对路径；两者任选一种。`-t / --type` 是提交时的必填参数，当前使用 bulk；scrna 会在提交前提示单细胞流程待配置。`tf` 单独运行打开 TUI，`tf --help` 查看参数。简写入口自动加载 TE 环境和代理，与下面的完整命令共用同一套调度逻辑。
+`-a / --accession` 传入编号，`-f / --file` 传入服务器 TXT 的绝对路径；两者任选一种。`-t / --type` 是提交时的必填参数，当前使用 bulk；scrna 会在提交前提示单细胞流程待配置。`tf` 单独运行打开 TUI，`tf --help` 查看参数。也可以在 TE 环境中直接运行本目录的 `bash tf.sh`；使用其他配置时传 `--settings <配置文件>`。
 
 ```bash
 # 单项目
@@ -70,6 +70,14 @@ GSE113777
 ```
 
 默认自动并行，无需 parallel 参数。CLI 在前台查看本批次，等待全部项目结束；Ctrl+C 退出查看时后台任务继续。
+
+TUI 可在启动前勾选「不保留FASTQ和BAM」，CLI 使用 `--discard-reads`。直接提交选样 CSV 的服务器绝对路径：
+
+```bash
+tf -f /root/te_model_selection.csv -t bulk --discard-reads
+```
+
+CSV 读取 `gsm` 和 `target_runs` 两列（多个 Run 用分号分隔）。**每个 GSM 是一个任务**：下载该 GSM 的全部 Run（每个 Run 放在 `<raw_root>/<GSM>/<Run>/`），按清单顺序把各 Run 的 FASTQ 直接拼接成一个样本（`pooled/<GSM>_R1/R2.fastq.gz`，单端为 `<GSM>.fastq.gz`），再做 fastp、STAR、链方向判断和 TEcount，结果为 `<output_root>/<GSM>/abundance/<GSM>.cntTable`。同一 GSM 内单双端不一致时在下载阶段报错，不做合并。同一批按清单顺序一次启动一个 GSM。重新提交 Run 列表不同的 GSM 会重新计数。GSM 与 Run 的对应写在任务目录的 samples.tsv。启用清理时，GSM 计数表通过格式和数值校验后，删除其全部 Run 的原始 FASTQ、合并 FASTQ、fastp 清洗 FASTQ 和 STAR BAM，保留计数表、质控报告、链方向判断、元数据和日志。计数失败时保留已有输入和中间数据，使用原命令重新提交即可续跑。提交整个 GSE 时仍会先下载该 GSE 的所有 Run，再逐 Run 计数和清理。默认关闭清理。
 
 终端内显示动态概览；重定向到文件时只输出阶段、进度和状态变化。需要工具细节时使用 --verbose：
 
@@ -148,11 +156,15 @@ settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制�
 - 调度记录：/root/teflow/state/jobs.json、scheduler.log
 - 旧版备份：/root/teflow-backups/20261014-v1.tar.gz
 
+**链方向**：每个样本比对后先运行 `infer_strandedness`，用最多 40 万条唯一比对的 reads 与基因 GTF 的 exon 方向比较（双端以 read1 为准），结果写入 `qc/<样本>.strandedness.json` 并传给 TEcount 的 `--stranded`：read1 与基因同向 ≥80% 为 forward，反向 ≥80% 为 reverse（dUTP / TruSeq Stranded 等），其余为 no（不分链；介于 60%–80% 时在 reason 中提示人工核对）。`settings.yaml` 的 `stranded` 默认 `auto`，也可固定为 `no`、`forward` 或 `reverse`。2.5 之前的结果使用 TEcount 默认的 `--stranded`（正向）；对反向链建库的旧结果需要重新计数。
+
 单双端类型由公开元数据决定，无需另传参数。双端保持 fastp 两份输入/输出、STAR 两份 reads；单端使用一份输入/输出、STAR 一份 reads。TEcount 和合并表的处理流程保持一致；类型未知、配对缺失或单端多份 FASTQ 无法唯一确定时明确报错。单细胞分析尚未接入，待补充。
 
-setup/create-te.sh 用于重建环境，已经配置好的服务器直接使用启动命令即可。setup/conda-explicit.txt 和 setup/pip-lock.txt 保存软件版本记录。
+`setup/create-te.sh` 用于重建环境。安装前把 `TEFLOW_ENV_PREFIX` 设为目标环境目录，并使配置的 `environment` 与之对应；需要代理时把 `TEFLOW_PROXY_ENV` 设为代理配置文件。`setup/conda-explicit.txt` 和 `setup/pip-lock.txt` 保存软件版本记录。
 
 ## 实施与验证记录
+
+2.5：选样 CSV 改为按 GSM 合并 Run 计数；新增链方向自动判断并传给 TEcount；清理与结果复用按 GSM 进行。验证记录见本节末尾。
 
 测试包括真实 Linux 调度器/worker 多进程、资源排队与失败隔离、GEO 范围解析、Snakemake DAG、CLI 及 Textual Pilot。详细验证产物保存在服务器的 verification/ 目录。
 

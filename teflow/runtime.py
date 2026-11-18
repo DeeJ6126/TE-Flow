@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 import yaml
 
 from .data_types import validate_data_type
-from .inputs import normalize_accession, parse_inputs
+from .inputs import normalize_accession, parse_batch
 from .failures import known_failure, valid_failure
 from .network import check_network, requirements_for_job
 from .resources import available_capacity, detect_budget
@@ -108,7 +108,7 @@ def worker_environment(settings: dict) -> dict:
     environment.setdefault("TERM", "xterm-256color")
     environment["PYTHONUNBUFFERED"] = "1"
     environment["TZ"] = "Asia/Shanghai"
-    proxy_file = Path(settings.get("proxy_env", "/home/codex/server-213-setup/proxy.env"))
+    proxy_file = Path(settings.get("proxy_env") or ".")
     if proxy_file.is_file():
         for line in proxy_file.read_text().splitlines():
             if not line.strip() or line.lstrip().startswith("#"):
@@ -134,12 +134,29 @@ def count_path(job: dict, run: str, sample: dict | None = None) -> Path:
     return base / "abundance" / f"{run}.cntTable"
 
 
+def pooled_result(job: dict) -> Path:
+    """Count table of a GSM job whose Runs are pooled into one sample."""
+    return Path(job["job_dir"]) / "abundance" / f"{job['accession']}.cntTable"
+
+
 def raw_manifest_valid(job: dict) -> bool:
     try:
         document = json.loads((Path(job["job_dir"]) / "samples.json").read_text())
         if document.get("accession") != job["accession"] or not document.get("samples"):
             return False
-        for sample in document["samples"].values():
+        pooled = document.get("pooled")
+        if pooled and job.get("discard_reads"):
+            table = pooled_result(job)
+            receipt = table.parent / f".{job['accession']}.cleaned"
+            if table.is_file() and table.stat().st_size and (receipt.is_file() or receipt.with_suffix(".pending").is_file()):
+                return True
+        for run, sample in document["samples"].items():
+            if job.get("discard_reads") and not pooled:
+                table = count_path(job, run, sample)
+                receipt = table.parent / f".{run}.cleaned"
+                pending = receipt.with_suffix(".pending")
+                if table.is_file() and table.stat().st_size and (receipt.is_file() or pending.is_file()):
+                    continue
             expected = {item["name"]: item.get("bytes") for item in sample.get("files", [])}
             # Existing manifests predate layout and always contain both mates.
             layout = sample.get("library_layout", "PAIRED" if sample.get("r1") and sample.get("r2") else "")
@@ -164,8 +181,9 @@ class JobManager:
         self.settings = yaml.safe_load(self.settings_path.read_text(encoding="utf-8"))
         if not isinstance(self.settings, dict):
             raise ValueError("settings.yaml 格式错误。")
-        for key in ("raw_root", "output_root", "template_dir", "environment"):
-            self.settings[key] = str(Path(self.settings[key]).expanduser().resolve())
+        for key in ("raw_root", "output_root", "template_dir", "environment", "proxy_env", "template_home", "state_dir"):
+            if self.settings.get(key):
+                self.settings[key] = str((self.settings_path.parent / Path(self.settings[key]).expanduser()).resolve())
         self.settings["threads"] = int(self.settings.get("threads", 10))
         self.settings["mem_mb"] = int(self.settings.get("mem_mb", 256000))
         if self.settings["threads"] < 1 or self.settings["mem_mb"] < 200000:
@@ -230,7 +248,7 @@ class JobManager:
                                updated_at=timestamp())
                     self._job_save(job)
                     changed = True
-            if job["status"] in ACTIVE:
+            if job["status"] == "running":
                 try:
                     manifest = json.loads((Path(job["job_dir"]) / "samples.json").read_text())
                     samples = manifest.get("samples", {})
@@ -295,13 +313,13 @@ class JobManager:
             self._job_save(job)
             return dict(job)
 
-    def submit(self, accession: str, *, data_type: str | None = None) -> dict:
-        return self.submit_many(accession, input_mode="accessions", data_type=data_type)[0]
+    def submit(self, accession: str, *, data_type: str | None = None, discard_reads: bool = False) -> dict:
+        return self.submit_many(accession, input_mode="accessions", data_type=data_type, discard_reads=discard_reads)[0]
 
     def submit_many(self, source: str, input_mode: str = "auto", cores: int | None = None,
-                    *, data_type: str | None = None) -> list[dict]:
+                    *, data_type: str | None = None, discard_reads: bool = False) -> list[dict]:
         data_type = validate_data_type(data_type)
-        accessions = parse_inputs(source, input_mode)
+        accessions, runs_by_gsm = parse_batch(source, input_mode)
         if cores is not None and (isinstance(cores, bool) or int(cores) < 1):
             raise ValueError("cores 必须大于零。")
         for accession in accessions:
@@ -340,9 +358,16 @@ class JobManager:
                 old = registry["jobs"].get(accession)
                 if old and old["data_type"] != data_type:
                     raise ValueError(f"{accession} 已记录为 {old['data_type']} 类型，无法按 {data_type} 提交。")
+                runs = runs_by_gsm.get(accession)
+                if old and runs and old.get("runs") != runs:
+                    if old["status"] in ACTIVE:
+                        raise ValueError(f"{accession} 正在运行，Run 列表与清单不一致，请在完成后重新提交。")
+                    old = None  # Different Run set: count the GSM again.
                 if old and old["status"] in ACTIVE:
+                    if discard_reads and not old.get("discard_reads"):
+                        raise ValueError(f"{accession} 正在按保留模式运行，请在完成后提交清理。")
                     reusable[accession] = dict(old)
-                elif old and old["status"] == "succeeded":
+                elif old and old["status"] == "succeeded" and (not discard_reads or old.get("discard_reads")):
                     result = Path(old["result_path"])
                     if result.is_file() and result.stat().st_size and raw_manifest_valid(old):
                         reusable[accession] = dict(old)
@@ -364,20 +389,19 @@ class JobManager:
             jobs = []
             for accession in accessions:
                 existing = registry["jobs"].get(accession)
-                if existing and existing["status"] in ACTIVE:
-                    jobs.append(dict(existing))
+                if accession in reusable:
+                    jobs.append(reusable[accession])
                     continue
-                if existing and existing["status"] == "succeeded":
-                    result = Path(existing["result_path"])
-                    if result.is_file() and result.stat().st_size and raw_manifest_valid(existing):
-                        jobs.append(dict(existing))
-                        continue
                 job_dir = Path(self.settings["output_root"]) / accession
                 raw_dir = Path(self.settings["raw_root"]) / accession
                 job_dir.mkdir(parents=True, exist_ok=True)
                 raw_dir.mkdir(parents=True, exist_ok=True)
-                result = job_dir / "abundance" / f"{accession}.cntTable" if is_run(accession) else job_dir / "merged.count"
+                runs = runs_by_gsm.get(accession)
+                result = (job_dir / "abundance" / f"{accession}.cntTable" if is_run(accession) or runs
+                          else job_dir / "merged.count")
                 job = {"accession": accession, "data_type": data_type,
+                       "discard_reads": discard_reads, "runs": runs,
+                       "gsm": accession if runs else (existing or {}).get("gsm"),
                        "status": "queued", "stage": "metadata", "step": "等待资源",
                        "pid": None, "snakemake_pid": None, "job_dir": str(job_dir), "raw_dir": str(raw_dir),
                        "result_path": str(result), "total_runs": 0, "downloaded_runs": 0, "analyzed_runs": 0,
@@ -404,7 +428,7 @@ class JobManager:
         suffix = {"qc": "fastp", "align": "STAR", "count": "TEcount",
                   "质控": "fastp", "比对": "STAR", "计数": "TEcount"}.get(job.get("step")) or {
                       "qc": "fastp", "align": "STAR", "count": "TEcount"}.get(job.get("stage"))
-        if sample and suffix and re.fullmatch(r"[SED]RR\d+", sample):
+        if sample and suffix and re.fullmatch(r"[SED]RR\d+|GSM\d+", sample):
             base = f"{sample}/" if job["accession"].startswith("GSE") else ""
             names.append(f"{base}logs/{sample}.{suffix}.log")
             if base:
@@ -424,7 +448,7 @@ def scheduler_tick(manager: JobManager) -> bool:
     """Atomically reserve resources and launch ready projects; return work remains."""
     with manager._lock():
         registry = manager._load()
-        manager._refresh(registry)
+        changed = manager._refresh(registry)
         jobs = registry["jobs"]
         if not any(job["status"] in ACTIVE for job in jobs.values()):
             registry["scheduler"] = {}
@@ -432,12 +456,21 @@ def scheduler_tick(manager: JobManager) -> bool:
             return False
         if "budget" not in registry:
             registry["budget"] = detect_budget(manager.settings)
+            changed = True
         free_cores, free_mem = available_capacity(registry["budget"], list(jobs.values()))
         queued = sorted((job for job in jobs.values() if job["status"] == "queued"),
                         key=lambda job: job.get("queued_at", job["created_at"]))
+        busy_batches = {j["batch_id"] for j in jobs.values() if j["status"] == "running" and j.get("discard_reads")}
         for job in queued:
-            if job["cores"] > free_cores or job["mem_mb"] > free_mem:
-                job["queue_wait_reason"] = f"等待资源：需 {job['cores']} CPU / {job['mem_mb']} MB；当前余量 {free_cores} CPU / {max(0, free_mem)} MB。"
+            reason = ""
+            if job.get("discard_reads") and job["batch_id"] in busy_batches:
+                reason = "等待本批上一个任务结束。"
+            elif job["cores"] > free_cores or job["mem_mb"] > free_mem:
+                reason = f"等待资源：需 {job['cores']} CPU / {job['mem_mb']} MB；当前余量 {free_cores} CPU / {max(0, free_mem)} MB。"
+            if reason:
+                if job.get("queue_wait_reason") != reason:
+                    job["queue_wait_reason"] = reason
+                    changed = True
                 continue
             try:
                 validate_data_type(job.get("data_type", "bulk"))
@@ -449,13 +482,17 @@ def scheduler_tick(manager: JobManager) -> bool:
                         env=worker_environment(manager.settings), cwd=manager.app_dir, start_new_session=True)
                 job.update(status="running", pid=process.pid, pid_start=proc_start(process.pid),
                            attempt_started_at=timestamp(), step="准备解析项目", queue_wait_reason="")
+                if job.get("discard_reads"):
+                    busy_batches.add(job["batch_id"])
                 free_cores -= job["cores"]
                 free_mem -= job["mem_mb"]
             except Exception as exc:
                 job.update(status="failed", error=f"后台启动失败：{exc}", exit_code=1, finished_at=timestamp())
             job["updated_at"] = timestamp()
             manager._job_save(job)
-        manager._save(registry)
+            changed = True
+        if changed:
+            manager._save(registry)
         return True
 
 
@@ -479,12 +516,13 @@ def run_scheduler(settings_path: str) -> int:
 
 def effective_config(manager: JobManager, job: dict) -> dict:
     validate_data_type(job.get("data_type", "bulk"))
-    config = yaml.safe_load((Path(manager.settings["template_dir"]) / "config.yaml").read_text())
+    template_dir = Path(manager.settings["template_dir"])
+    config = yaml.safe_load((template_dir / "config.yaml").read_text())
     for key in ("INDEX_PREFIX", "GENOME_ANNOTATION", "TE_ANNOTATION"):
         value = str(config[key])
         if value.startswith("~/"):
-            value = str(Path(manager.settings.get("template_home", "/root")) / value[2:])
-        path = Path(value).resolve()
+            value = str(Path(manager.settings.get("template_home", Path.home())) / value[2:])
+        path = (template_dir / Path(value)).resolve()
         if not path.exists() or not os.access(path, os.R_OK):
             raise RuntimeError(f"{key} 文件不存在或不可读：{path}")
         config[key] = str(path)
@@ -494,7 +532,9 @@ def effective_config(manager: JobManager, job: dict) -> dict:
                    "ISEQ_BIN": str(Path(manager.settings["environment"]) / "bin" / "iseq"),
                    "DOWNLOAD_RETRIES": int(manager.settings.get("download_retries", 3)),
                    "METADATA_TIMEOUT": int(manager.settings.get("metadata_timeout", 180)),
-                   "OUTPUT_SPACE_MULTIPLIER": 4})
+                   "GSM": job.get("gsm") or "", "RUNS": list(job.get("runs") or []),
+                   "STRANDED": str(manager.settings.get("stranded", "auto")),
+                   "DISCARD_READS": bool(job.get("discard_reads")), "OUTPUT_SPACE_MULTIPLIER": 4})
     return config
 
 
@@ -580,7 +620,11 @@ def run_worker(settings_path: str, accession: str) -> int:
                    "--configfile", str(output / "config.yaml"), "--cores", str(job.get("cores", manager.settings["threads"])),
                    "--resources", "star_slots=1", "download_slots=1",
                    f"mem_mb={job.get('mem_mb', manager.settings['mem_mb'])}", "--rerun-incomplete", "--printshellcmds"]
-        rule_steps = {"quality_control": "质控", "quality_control_single": "质控", "star_align": "比对", "te_count": "计数"}
+        if job.get("discard_reads"):
+            command.append("--keep-going")
+        rule_steps = {"pool_reads_paired": "合并 FASTQ", "pool_reads_single": "合并 FASTQ", "quality_control": "质控",
+                      "quality_control_single": "质控", "star_align": "比对", "infer_strandedness": "判断链方向",
+                      "te_count": "计数"}
         process = subprocess.Popen(command, cwd=manager.app_dir, env=environment, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
                                    start_new_session=True)
@@ -616,7 +660,7 @@ def run_worker(settings_path: str, accession: str) -> int:
                         manager.update(accession, stage="analyze", step=rule_steps[rule])
                     elif rule == "merge_counts":
                         manager.update(accession, stage="merge", step="汇总结果")
-                sample = re.search(r"wildcards:\s+sample=([SED]RR\d+)", line)
+                sample = re.search(r"wildcards:\s+sample=([SED]RR\d+|GSM\d+)", line)
                 if sample:
                     manager.update(accession, current_sample=sample.group(1))
         exit_code = process.wait()

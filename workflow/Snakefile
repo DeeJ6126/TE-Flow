@@ -1,4 +1,7 @@
-"""Accession → iSeq SINGLE/PAIRED FASTQ → fastp → STAR → TEcount → merged.count.
+"""Accession → iSeq SINGLE/PAIRED FASTQ → fastp → STAR → strandedness → TEcount → merged.count.
+
+With RUNS (a GSM from a selection CSV) all Runs of the GSM are concatenated into one
+sample named after the GSM before QC; the result is abundance/<GSM>.cntTable.
 
 Run with --directory JOB_DIR --configfile JOB_DIR/config.yaml.  Reference files
 are supplied by the existing project; this workflow never builds an index.
@@ -28,6 +31,14 @@ for reference in INDEX_FILES + [GENOME_ANNOTATION, TE_ANNOTATION]:
     if not Path(reference).is_file() or Path(reference).stat().st_size == 0:
         raise ValueError(f"参考文件缺失或为空: {reference}")
 
+RUNS = [str(run).strip().upper() for run in (config.get("RUNS") or [])]
+POOLED = bool(RUNS)
+if POOLED and not ACCESSION.startswith("GSM"):
+    raise ValueError("RUNS 只能与 GSM 编号一起使用。")
+STRANDED = str(config.get("STRANDED", "auto")).lower()
+if STRANDED not in {"auto", "no", "forward", "reverse"}:
+    raise ValueError("STRANDED 必须是 auto、no、forward 或 reverse。")
+
 MANIFEST = os.path.join(OUTPUT_DIR, "samples.json")
 GEO = ACCESSION.startswith("GSE")
 RUN_ROOT = os.path.join(OUTPUT_DIR, "{sample}") if GEO else OUTPUT_DIR
@@ -35,6 +46,12 @@ QC_DIR = os.path.join(RUN_ROOT, "qc")
 ALIGN_DIR = os.path.join(RUN_ROOT, "align")
 ABUNDANCE_DIR = os.path.join(RUN_ROOT, "abundance")
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
+POOL_DIR = os.path.join(OUTPUT_DIR, "pooled")
+
+# Samples are Runs, or a GSM whose Runs are pooled. This also keeps "{sample}.json"
+# (fastp) from matching "<sample>.strandedness.json".
+wildcard_constraints:
+    sample=r"(?:[SED]RR|GSM)\d+"
 
 
 def samples_manifest(wildcards):
@@ -46,7 +63,28 @@ def samples_manifest(wildcards):
     return document
 
 
+def pooled_info(wildcards):
+    pooled = samples_manifest(wildcards).get("pooled")
+    if not pooled or pooled.get("sample") != wildcards.sample:
+        raise ValueError(f"{wildcards.sample}: 样本清单中没有该 GSM 的合并信息。")
+    return pooled
+
+
+def pooled_inputs(wildcards, mate, required_layout):
+    pooled = pooled_info(wildcards)
+    if pooled["library_layout"] != required_layout:
+        raise ValueError(f"{wildcards.sample}: 当前 GSM 不属于 {required_layout} 分支。")
+    samples = samples_manifest(wildcards)["samples"]
+    return [samples[run][mate] for run in pooled["runs"]]
+
+
 def raw_pair(wildcards, mate, required_layout):
+    if POOLED:
+        if sample_layout(wildcards) != required_layout:
+            raise ValueError(f"{wildcards.sample}: 当前 GSM 不属于 {required_layout} 分支。")
+        if required_layout == "SINGLE":
+            return os.path.join(POOL_DIR, f"{wildcards.sample}.fastq.gz")
+        return os.path.join(POOL_DIR, f"{wildcards.sample}_R{mate[1]}.fastq.gz")
     samples = samples_manifest(wildcards)["samples"]
     if wildcards.sample not in samples:
         raise ValueError(f"样本清单中没有 {wildcards.sample}。")
@@ -56,6 +94,8 @@ def raw_pair(wildcards, mate, required_layout):
 
 
 def sample_layout(wildcards):
+    if POOLED:
+        return pooled_info(wildcards)["library_layout"]
     sample = samples_manifest(wildcards)["samples"][wildcards.sample]
     # Manifests written before layout support contain the paired r1/r2 fields.
     layout = sample.get("library_layout", "PAIRED" if sample.get("r1") and sample.get("r2") else "")
@@ -80,10 +120,21 @@ def count_tables(wildcards):
     return [os.path.join(ABUNDANCE_DIR.format(sample=run), f"{run}.cntTable") for run in samples]
 
 
+def cleanup_receipts(wildcards):
+    if not config.get("DISCARD_READS", False):
+        return []
+    if POOLED:
+        return [os.path.join(ABUNDANCE_DIR, f".{ACCESSION}.cleaned")]
+    return [os.path.join(ABUNDANCE_DIR.format(sample=run), f".{run}.cleaned")
+            for run in samples_manifest(wildcards)["samples"]]
+
+
+
 rule all:
     input:
-        (os.path.join(ABUNDANCE_DIR, f"{ACCESSION}.cntTable") if RUN_PATTERN.fullmatch(ACCESSION)
-         else os.path.join(OUTPUT_DIR, "merged.count"))
+        (os.path.join(ABUNDANCE_DIR, f"{ACCESSION}.cntTable") if RUN_PATTERN.fullmatch(ACCESSION) or POOLED
+         else os.path.join(OUTPUT_DIR, "merged.count")),
+        cleanup_receipts
 
 
 checkpoint prepare_samples:
@@ -91,12 +142,14 @@ checkpoint prepare_samples:
         MANIFEST
     params:
         accession=ACCESSION,
+        gsm=config.get("GSM", ""),
         samples_dir=SAMPLES_DIR,
         output_dir=OUTPUT_DIR,
         iseq_bin=config.get("ISEQ_BIN", "iseq"),
         retries=int(config.get("DOWNLOAD_RETRIES", 3)),
         metadata_timeout=int(config.get("METADATA_TIMEOUT", 180)),
-        output_space_multiplier=float(config.get("OUTPUT_SPACE_MULTIPLIER", 4))
+        output_space_multiplier=float(config.get("OUTPUT_SPACE_MULTIPLIER", 4)),
+        runs=RUNS
     threads:
         min(THREADS, 8)
     resources:
@@ -106,6 +159,39 @@ checkpoint prepare_samples:
         os.path.join(LOG_DIR, "prepare_samples.log")
     script:
         "scripts/prepare_samples.py"
+
+
+rule pool_reads_paired:
+    """Concatenate the GSM's Runs in manifest order (gzip members concatenate losslessly)."""
+    input:
+        r1=lambda wildcards: pooled_inputs(wildcards, "r1", "PAIRED"),
+        r2=lambda wildcards: pooled_inputs(wildcards, "r2", "PAIRED")
+    output:
+        r1=temp(os.path.join(POOL_DIR, "{sample}_R1.fastq.gz")),
+        r2=temp(os.path.join(POOL_DIR, "{sample}_R2.fastq.gz"))
+    wildcard_constraints:
+        sample=r"GSM\d+"
+    threads:
+        1
+    resources:
+        mem_mb=1000
+    shell:
+        "cat {input.r1:q} > {output.r1:q} && cat {input.r2:q} > {output.r2:q}"
+
+
+rule pool_reads_single:
+    input:
+        r1=lambda wildcards: pooled_inputs(wildcards, "r1", "SINGLE")
+    output:
+        r1=temp(os.path.join(POOL_DIR, "{sample}.fastq.gz"))
+    wildcard_constraints:
+        sample=r"GSM\d+"
+    threads:
+        1
+    resources:
+        mem_mb=1000
+    shell:
+        "cat {input.r1:q} > {output.r1:q}"
 
 
 rule quality_control:
@@ -176,15 +262,35 @@ rule star_align:
         "--alignMatesGapMax 1000000 > {log:q} 2>&1"
 
 
+rule infer_strandedness:
+    input:
+        bam=os.path.join(ALIGN_DIR, "{sample}Aligned.sortedByCoord.out.bam"),
+        gene=GENOME_ANNOTATION
+    output:
+        os.path.join(QC_DIR, "{sample}.strandedness.json")
+    params:
+        override=STRANDED
+    threads:
+        1
+    resources:
+        mem_mb=4000
+    log:
+        os.path.join(LOG_DIR, "{sample}.strandedness.log")
+    script:
+        "scripts/infer_strandedness.py"
+
+
 rule te_count:
     input:
         bam=os.path.join(ALIGN_DIR, "{sample}Aligned.sortedByCoord.out.bam"),
         gene=GENOME_ANNOTATION,
-        te=TE_ANNOTATION
+        te=TE_ANNOTATION,
+        strand=os.path.join(QC_DIR, "{sample}.strandedness.json")
     output:
         table=os.path.join(ABUNDANCE_DIR, "{sample}.cntTable")
     params:
-        outdir=lambda wildcards: ABUNDANCE_DIR.format(sample=wildcards.sample)
+        outdir=lambda wildcards: ABUNDANCE_DIR.format(sample=wildcards.sample),
+        validator=os.path.join(SCRIPT_DIR, "merge_counts.py")
     threads:
         1
     resources:
@@ -192,9 +298,11 @@ rule te_count:
     log:
         os.path.join(LOG_DIR, "{sample}.TEcount.log")
     shell:
-        "TEcount --format BAM --mode multi -b {input.bam:q} "
+        "STRAND=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"tecount\"])' {input.strand:q}) && "
+        "TEcount --format BAM --mode multi --stranded \"$STRAND\" -b {input.bam:q} "
         "--GTF {input.gene:q} --TE {input.te:q} --sortByPos "
         "--project {wildcards.sample:q} --outdir {params.outdir:q} > {log:q} 2>&1"
+        + (" && python {params.validator:q} {output.table:q} >> {log:q} 2>&1" if config.get("DISCARD_READS") else "")
 
 
 rule merge_counts:
@@ -211,3 +319,19 @@ rule merge_counts:
         os.path.join(LOG_DIR, "merge_counts.log")
     script:
         "scripts/merge_counts.py"
+
+rule discard_run_reads:
+    input:
+        table=os.path.join(ABUNDANCE_DIR, "{sample}.cntTable"),
+        manifest=MANIFEST
+    output:
+        receipt=os.path.join(ABUNDANCE_DIR, ".{sample}.cleaned")
+    params:
+        enabled=config.get("DISCARD_READS", False),
+        raw_root=SAMPLES_DIR,
+        output_root=OUTPUT_DIR,
+        accession=ACCESSION,
+        script_dir=SCRIPT_DIR
+    priority: 100
+    script:
+        "scripts/discard_reads.py"

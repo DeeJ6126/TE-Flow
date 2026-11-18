@@ -663,8 +663,14 @@ def download_lock(samples_dir: Path):
 
 def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: Path,
             log_path: Path, iseq_bin="iseq", threads=8, retries=3, metadata_timeout=180,
-            output_space_multiplier=4) -> dict:
+            output_space_multiplier=4, gsm="", runs=None) -> dict:
     accession = normalize_accession(accession)
+    runs = [normalize_accession(run) for run in (runs or [])]
+    pooled = bool(runs)
+    if pooled and not re.fullmatch(r"GSM\d+", accession):
+        raise ValueError("合并模式的任务编号必须是 GSM。")
+    if pooled and not all(RUN_PATTERN.fullmatch(run) for run in runs):
+        raise ValueError(f"{accession}: Run 列表无效。")
     if threads < 1 or retries < 1 or metadata_timeout < 1:
         raise ValueError("下载线程数、重试次数和元数据超时必须大于零。")
     if not shutil.which(iseq_bin):
@@ -679,13 +685,45 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
         progress("metadata", step="获取项目元数据", total_runs=0, downloaded_runs=0)
         geo = accession.startswith("GSE")
         mapping = []
-        if geo:
+        if pooled:
+            # One GSM, several Runs: each Run keeps its own raw directory and metadata
+            # cache; the workflow concatenates their FASTQs into a single sample.
+            records, fields = {}, None
+            for run in runs:
+                run_raw = samples_dir / run
+                run_raw.mkdir(parents=True, exist_ok=True)
+                metadata, run_fields, run_records = obtain_metadata(run, run_raw, iseq_bin, metadata_timeout, log)
+                if list(run_records) != [run]:
+                    raise ValueError(f"{accession}/{run}: 元数据返回的 Run 与清单不一致：{list(run_records)[:5]}")
+                record = run_records[run]
+                record.update(geo_samples=[accession], fields=run_fields, metadata_path=str(metadata))
+                records[run] = record
+                fields = fields or run_fields
+                mapping.append({"gse": "", "gsm": accession, "run": run,
+                                "experiment": record["row"].get("experiment_accession", "")})
+            layouts = {record["library_layout"] for record in records.values()}
+            if len(layouts) != 1:
+                detail = "，".join(f"{run}={record['library_layout']}" for run, record in records.items())
+                raise ValueError(f"{accession}: Run 的单双端类型不一致（{detail}），无法合并为一个样本。")
+            write_geo_mapping(output_dir / "samples.tsv", mapping)
+        elif geo:
             metadata, fields, records, mapping = obtain_geo_metadata(accession, samples_dir, log)
             write_geo_mapping(output_dir / "samples.tsv", mapping)
         else:
             metadata, fields, records = obtain_metadata(accession, samples_dir, iseq_bin, metadata_timeout, log)
+        if not geo and not pooled:
+            for run, record in records.items():
+                row = record["row"]
+                aliases = [v for v in (gsm, accession, row.get("sample_alias"), row.get("experiment_alias"))
+                           if v and re.fullmatch(r"GSM\d+", v)]
+                record["geo_samples"] = list(dict.fromkeys(aliases))
+                for sample_id in record["geo_samples"]:
+                    mapping.append({"gse": "", "gsm": sample_id, "run": run,
+                                    "experiment": row.get("experiment_accession", "")})
+            if mapping:
+                write_geo_mapping(output_dir / "samples.tsv", mapping)
         for run, record in records.items():
-            raw_dir = samples_dir / run if geo else samples_dir
+            raw_dir = samples_dir / run if geo or pooled else samples_dir
             raw_dir.mkdir(parents=True, exist_ok=True)
             record["raw_dir"] = str(raw_dir)
         raw_bytes = check_space(samples_dir, output_dir, records, float(output_space_multiplier))
@@ -704,8 +742,8 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
             # Use the already obtained per-Run row. Its complete column order is
             # retained because iSeq also has positional fields in its output code.
             run_metadata = run_dir / f"{run}.metadata.tsv"
-            if run_metadata != metadata:
-                write_metadata(run_metadata, fields, [record["row"]])
+            if run_metadata != Path(record.get("metadata_path", metadata)):
+                write_metadata(run_metadata, record.get("fields", fields), [record["row"]])
             already_complete = run in logged_runs(success_log) and pair_is_complete(run_dir, files)
             if already_complete:
                 status = "reused"
@@ -743,10 +781,11 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
                         explicit.failure.setdefault("run", run)
                     raise RuntimeError(f"{run}: {retries} 次下载后仍未完成；已下载数据保留，可重试。{last_error}") from last_error
             count_root = output_dir / run if geo else output_dir
+            count_name = accession if pooled else run
             samples[run] = {"r1": str(run_dir / files[0]["name"]),
                             "r2": str(run_dir / files[1]["name"]) if record["library_layout"] == "PAIRED" else None,
                             "raw_dir": str(run_dir),
-                            "count_path": str(count_root / "abundance" / f"{run}.cntTable"),
+                            "count_path": str(count_root / "abundance" / f"{count_name}.cntTable"),
                             "geo_samples": record.get("geo_samples", []),
                             "experiments": record.get("experiments", []),
                             "files": [{"name": item["name"], "path": str(run_dir / item["name"]),
@@ -758,8 +797,11 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
         document = {"accession": accession, "samples": samples, "total_runs": len(samples),
                     "raw_bytes": sum(item["bytes"] for sample in samples.values() for item in sample["files"]),
                     "prepared_at": datetime.now(timezone.utc).isoformat(),
-                    "metadata": str(metadata), "layout": "geo_nested" if geo else "flat",
-                    "mapping": mapping, "mapping_path": str(output_dir / "samples.tsv") if geo else None}
+                    "metadata": str(metadata), "layout": "geo_nested" if geo else "pooled" if pooled else "flat",
+                    "mapping": mapping, "mapping_path": str(output_dir / "samples.tsv") if mapping else None}
+        if pooled:
+            document["pooled"] = {"sample": accession, "runs": list(samples),
+                                  "library_layout": next(iter(samples.values()))["library_layout"]}
         atomic_json(manifest_path, document)
         log_message(f"下载准备完成: {len(samples)} 个 Run。", log)
         return document
@@ -781,4 +823,5 @@ if "snakemake" in globals():
                     Path(snakemake.params.output_dir), Path(snakemake.output[0]), Path(snakemake.log[0]),
                     iseq_bin=snakemake.params.iseq_bin, threads=int(snakemake.threads),
                     retries=int(snakemake.params.retries), metadata_timeout=int(snakemake.params.metadata_timeout),
-                    output_space_multiplier=float(snakemake.params.output_space_multiplier))
+                    output_space_multiplier=float(snakemake.params.output_space_multiplier), gsm=snakemake.params.gsm,
+                    runs=list(snakemake.params.runs))

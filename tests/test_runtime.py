@@ -292,3 +292,58 @@ def test_nested_projects_read_actual_project_tool_logs(manager):
     job = manager.update("GSE1", stage="analyze", step="比对", current_sample="SRR1")
     assert "FATAL ERROR" in manager.log_tail("GSE1")
     assert "FATAL ERROR" in runtime._failure_message(output, 1, job)
+
+
+def test_selection_csv_submits_one_pooled_job_per_gsm_and_serializes_cleanup(manager, tmp_path):
+    source = tmp_path / "selection.csv"
+    source.write_text("gsm,target_runs\nGSM1,SRR3;SRR2\nGSM2,SRR1\n")
+    jobs = manager.submit_many(str(source), data_type="bulk", discard_reads=True)
+    assert [(j["accession"], j["gsm"], j["runs"]) for j in jobs] == [("GSM1", "GSM1", ["SRR3", "SRR2"]),
+                                                                     ("GSM2", "GSM2", ["SRR1"])]
+    assert jobs[0]["result_path"].endswith(str(Path("GSM1") / "abundance" / "GSM1.cntTable"))
+    config = effective_config(manager, jobs[0])
+    assert config["DISCARD_READS"] and config["RUNS"] == ["SRR3", "SRR2"] and config["STRANDED"] == "auto"
+    scheduler_tick(manager)
+    assert [manager.get_job(j["accession"])["status"] for j in jobs] == ["running", "queued"]
+    manager.update("GSM1", status="failed")
+    scheduler_tick(manager)
+    assert manager.get_job("GSM2")["status"] == "running"
+
+
+def test_selection_csv_rejects_duplicate_gsm_and_shared_run(manager, tmp_path):
+    source = tmp_path / "selection.csv"
+    source.write_text("gsm,target_runs\nGSM1,SRR1\nGSM1,SRR2\n")
+    with pytest.raises(ValueError, match="重复"):
+        manager.submit_many(str(source), data_type="bulk")
+    source.write_text("gsm,target_runs\nGSM1,SRR1\nGSM2,SRR1\n")
+    with pytest.raises(ValueError, match="多个 GSM"):
+        manager.submit_many(str(source), data_type="bulk")
+
+
+def test_resubmitting_gsm_with_other_runs_counts_again(manager, tmp_path):
+    source = tmp_path / "selection.csv"
+    source.write_text("gsm,target_runs\nGSM1,SRR1\n")
+    first = manager.submit_many(str(source), data_type="bulk")[0]
+    manager.update("GSM1", status="succeeded")
+    source.write_text("gsm,target_runs\nGSM1,SRR1;SRR2\n")
+    second = manager.submit_many(str(source), data_type="bulk")[0]
+    assert second["runs"] == ["SRR1", "SRR2"] and second["attempt"] == first["attempt"] + 1
+
+
+def test_pooled_manifest_with_cleaned_receipt_is_reusable(manager, tmp_path):
+    job = {"accession": "GSM7", "job_dir": str(tmp_path / "GSM7"), "discard_reads": True}
+    table = Path(job["job_dir"]) / "abundance" / "GSM7.cntTable"
+    table.parent.mkdir(parents=True)
+    table.write_text("gene\tcount\nA\t1\n")
+    (Path(job["job_dir"]) / "samples.json").write_text(json.dumps({
+        "accession": "GSM7", "pooled": {"sample": "GSM7", "runs": ["SRR8"], "library_layout": "SINGLE"},
+        "samples": {"SRR8": {"r1": str(tmp_path / "gone.fastq.gz"), "library_layout": "SINGLE"}}}))
+    assert not runtime.raw_manifest_valid(job)
+    (table.parent / ".GSM7.cleaned").write_text("GSM7\n")
+    assert runtime.raw_manifest_valid(job)
+
+
+def test_stranded_setting_reaches_workflow_config(manager):
+    manager.settings["stranded"] = "reverse"
+    job = manager.submit("SRR1", data_type="bulk")
+    assert effective_config(manager, job)["STRANDED"] == "reverse"

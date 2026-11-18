@@ -33,17 +33,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--settings", help="应用 settings.yaml 路径")
     commands = parser.add_subparsers(dest="command")
     run = commands.add_parser("run", help="批量运行并查看进度，自动按资源并行")
-    run.add_argument("source", help="逗号分隔编号，或服务器 TXT 文件的绝对路径（每行一个编号）")
+    run.add_argument("source", help="逗号分隔编号，或服务器编号 TXT 或选样 CSV 的绝对路径（每行一个编号）")
     run.add_argument("-t", "--type", dest="data_type", choices=DATA_TYPES, required=True,
                      help="数据类型：bulk；scrna 单细胞流程待配置")
     run.add_argument("--input-mode", choices=("auto", "accessions", "file"), default="auto",
                      help="输入方式，默认自动识别")
     run.add_argument("--cores", type=_positive_integer, help="每个项目使用的 CPU 数，默认读取配置")
     run.add_argument("--verbose", "-v", action="store_true", help="显示详细工具日志")
+    run.add_argument("--discard-reads", action="store_true", help="每个 Run 计数成功后清理原始及清洗后的 FASTQ 和 BAM")
     submit = commands.add_parser("submit", help="提交单个编号后立即返回（维护入口）")
     submit.add_argument("accession")
     submit.add_argument("-t", "--type", dest="data_type", choices=DATA_TYPES, required=True,
                         help="数据类型：bulk；scrna 单细胞流程待配置")
+    submit.add_argument("--discard-reads", action="store_true", help="每个 Run 计数成功后清理原始及清洗后的 FASTQ 和 BAM")
     status = commands.add_parser("status", help="以 JSON 查看任务状态")
     status.add_argument("accession", nargs="?")
     logs = commands.add_parser("logs", help="查看详细日志")
@@ -73,16 +75,17 @@ def shortcut_main(argv: Sequence[str] | None = None) -> int:
     )
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("-a", "--accession", help="单个编号或逗号分隔的多个编号")
-    source_group.add_argument("-f", "--file", help="服务器 TXT 文件的绝对路径，每行一个编号")
+    source_group.add_argument("-f", "--file", help="服务器编号 TXT 或选样 CSV 的绝对路径，每行一个编号")
     parser.add_argument("-t", "--type", dest="data_type", choices=DATA_TYPES,
                         help="运行时必须指定数据类型：bulk；scrna 单细胞流程待配置")
     parser.add_argument("--settings", help="应用 settings.yaml 路径")
     parser.add_argument("--cores", type=_positive_integer, help="每个项目使用的 CPU 数，默认读取配置")
     parser.add_argument("--verbose", "-v", action="store_true", help="显示详细工具日志")
+    parser.add_argument("--discard-reads", action="store_true", help="每个 Run 计数成功后清理原始及清洗后的 FASTQ 和 BAM")
     args = parser.parse_args(argv)
     forwarded = [f"--settings={args.settings}"] if args.settings is not None else []
     if args.accession is None and args.file is None:
-        if args.cores is not None or args.verbose or args.data_type is not None:
+        if args.cores is not None or args.verbose or args.discard_reads or args.data_type is not None:
             parser.error("请使用 -a 指定编号或 -f 指定 TXT；直接运行 tf 打开 TUI。")
         return main(forwarded)
     if args.data_type is None:
@@ -92,6 +95,8 @@ def shortcut_main(argv: Sequence[str] | None = None) -> int:
     forwarded.extend(["run", "--input-mode", mode, "--type", args.data_type])
     if args.cores is not None:
         forwarded.extend(["--cores", str(args.cores)])
+    if args.discard_reads:
+        forwarded.append("--discard-reads")
     if args.verbose:
         forwarded.append("--verbose")
     # An explicit positional boundary also preserves values beginning with '-'.
@@ -178,7 +183,7 @@ def watch_jobs(manager: JobManager, submitted: list[dict], *, verbose: bool = Fa
     tracker = ProgressTracker()
     last_progress: dict[str, tuple] = {}
     last_progress_print: dict[str, float] = {}
-    progress = {str(job["accession"]): tracker.snapshot(job) for job in jobs}
+    progress = {str(job["accession"]): tracker.snapshot(job) for job in jobs if value(job.get("status")) == "running"}
     use_live = console.is_terminal and not console.is_dumb_terminal
     live = Live(render_batch(jobs, progress), console=console, auto_refresh=False, transient=False) if use_live else None
     try:
@@ -188,16 +193,16 @@ def watch_jobs(manager: JobManager, submitted: list[dict], *, verbose: bool = Fa
             console.print(Text("流程：" + " → ".join(label for _, label in STAGES)))
             console.print(Text(batch_summary(jobs)))
         while True:
-            progress = {str(job["accession"]): tracker.snapshot(job) for job in jobs}
+            progress = {str(job["accession"]): tracker.snapshot(job) for job in jobs if value(job.get("status")) == "running"}
             if live:
                 live.update(render_batch(jobs, progress), refresh=True)
             for job in jobs:
                 accession = str(job["accession"])
                 signature = progress_signature(job)
-                snapshot = progress[accession]
+                snapshot = progress.get(accession)
                 metric_key = (snapshot.stage, snapshot.label, snapshot.current_bytes, snapshot.total_bytes,
                               snapshot.completed_runs, snapshot.total_runs,
-                              None if snapshot.speed_bps is None else snapshot.speed_bps > 0)
+                              None if snapshot.speed_bps is None else snapshot.speed_bps > 0) if snapshot else ()
                 changed = signatures.get(accession) != signature
                 tick = time.monotonic()
                 if not live:
@@ -250,10 +255,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         manager = JobManager(args.settings)
         if args.command == "run":
             jobs = manager.submit_many(args.source, input_mode=args.input_mode, cores=args.cores,
-                                       data_type=args.data_type)
+                                       data_type=args.data_type, **({"discard_reads": True} if args.discard_reads else {}))
             return watch_jobs(manager, jobs, verbose=args.verbose, console=console)
         if args.command == "submit":
-            print(json.dumps(manager.submit(args.accession, data_type=args.data_type), ensure_ascii=False, indent=2))
+            print(json.dumps(manager.submit(args.accession, data_type=args.data_type, **({"discard_reads": True} if args.discard_reads else {})), ensure_ascii=False, indent=2))
         elif args.command == "status":
             print(json.dumps(manager.get_job(args.accession) if args.accession else manager.list_jobs(), ensure_ascii=False, indent=2))
         elif args.command == "logs":

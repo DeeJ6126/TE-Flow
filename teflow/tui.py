@@ -14,7 +14,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.widgets import Button, Footer, Header, Input, RichLog, Select, Static, TabbedContent, TabPane, Tree
+from textual.widgets import Button, Checkbox, Footer, Header, Input, RichLog, Select, Static, TabbedContent, TabPane, Tree
 
 from .activity import activity_snapshot, log_snapshot
 from .failures import friendly_failure
@@ -79,7 +79,8 @@ class TEFlowApp(App):
     #data-type { width: 25; margin-right: 1; }
     #accession { width: 1fr; }
     #start { width: 8; min-width: 8; margin-left: 1; }
-    #feedback { height: 1; padding: 0 1; color: $text-muted; }
+    #options-row { height: 1; margin: 0 1; }
+    #feedback { width: 1fr; height: 1; padding: 0 1; color: $text-muted; }
     #feedback.error { color: $error; }
     #summary-row { height: 1; margin: 0 1; }
     #batch-summary { width: 1fr; }
@@ -161,10 +162,12 @@ class TEFlowApp(App):
         yield Header()
         with Horizontal(id="entry"):
             yield Select([("Bulk RNA-seq", "bulk"), ("单细胞 · 待配置", "scrna")], prompt="请选择数据类型", id="data-type")
-            yield Select([("编号列表", "accessions"), ("TXT 文件路径", "file")], value="accessions", allow_blank=False, id="input-mode")
+            yield Select([("编号列表", "accessions"), ("TXT / CSV 路径", "file")], value="accessions", allow_blank=False, id="input-mode")
             yield Input(placeholder="GSE113777,GSE…", id="accession")
             yield Button("开始", id="start", variant="primary")
-        yield Static("输入编号或服务器 TXT 路径；回车提交，自动并行。", id="feedback", markup=False)
+        with Horizontal(id="options-row"):
+            yield Checkbox("不保留FASTQ和BAM", id="discard-reads", compact=True)
+            yield Static("输入编号或服务器 TXT / CSV 路径；回车提交。", id="feedback", markup=False)
         with Horizontal(id="summary-row"):
             yield Static("批次：暂无任务", id="batch-summary", markup=False)
             yield Button("显示内部文件 [F3]", id="toggle-internal")
@@ -276,7 +279,7 @@ class TEFlowApp(App):
             self._feedback("单细胞分析流程待配置，暂不能运行。" if event.value == "scrna" else "已选择 Bulk RNA-seq；一次批量输入使用同一数据类型。" if event.value == "bulk" else "请选择数据类型。")
         if event.select.id == "input-mode":
             self.query_one("#accession", Input).placeholder = "服务器绝对路径，例如 /root/geo_ids.txt" if event.value == "file" else "GSE113777,GSE…"
-            self._feedback("TXT 位于服务器，每行一个编号。" if event.value == "file" else "多个编号用逗号分隔；回车提交，自动并行。")
+            self._feedback("输入服务器上的编号 TXT 或选样 CSV 路径。" if event.value == "file" else "多个编号用逗号分隔；回车提交，自动并行。")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "accession":
@@ -304,12 +307,12 @@ class TEFlowApp(App):
         self._submitting = True
         self.query_one("#start", Button).disabled = True
         self._feedback("正在读取输入并提交项目…")
-        self._submit(source, str(self.query_one("#input-mode", Select).value), data_type)
+        self._submit(source, str(self.query_one("#input-mode", Select).value), data_type, self.query_one("#discard-reads", Checkbox).value)
 
     @work(group="submit", exclusive=True, exit_on_error=False)
-    async def _submit(self, source: str, input_mode: str, data_type: str) -> None:
+    async def _submit(self, source: str, input_mode: str, data_type: str, discard_reads: bool = False) -> None:
         try:
-            jobs = await asyncio.to_thread(self.manager.submit_many, source, input_mode=input_mode, data_type=data_type)
+            jobs = await asyncio.to_thread(self.manager.submit_many, source, input_mode=input_mode, data_type=data_type, **({"discard_reads": True} if discard_reads else {}))
             if not jobs:
                 raise ValueError("输入中没有可提交的编号。")
             self._submission_accessions = {str(job["accession"]) for job in jobs}

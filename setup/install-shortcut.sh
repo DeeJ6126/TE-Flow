@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-APP=/root/teflow
+APP=$(dirname -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")")
 TARGET=/usr/local/bin/tf
 chmod 755 "$APP/tf.sh"
 if [[ -e "$TARGET" || -L "$TARGET" ]]; then

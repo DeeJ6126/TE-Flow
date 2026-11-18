@@ -1,5 +1,6 @@
 """Validate an entire batch before any job is submitted."""
 from pathlib import Path
+import csv
 import re
 
 
@@ -43,3 +44,40 @@ def parse_inputs(source: str, input_mode: str = "auto") -> list[str]:
     if not result:
         raise ValueError("编号清单为空。")
     return result
+
+def parse_batch(source, input_mode):
+    """Return (accessions, runs_by_gsm).
+
+    A selection CSV (columns gsm, target_runs) yields one job per GSM; its Runs are
+    pooled into a single sample before QC, alignment and counting.
+    """
+    path = Path(str(source).strip().strip("'\""))
+    if input_mode not in {"auto", "file"} or path.suffix.lower() != ".csv":
+        return parse_inputs(source, input_mode), {}
+    if not path.is_absolute():
+        raise ValueError("选样 CSV 需要服务器绝对路径。")
+    runs_by_gsm, owner = {}, {}
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not {"gsm", "target_runs"}.issubset(reader.fieldnames or []):
+            raise ValueError("选样 CSV 需包含 gsm 和 target_runs 列。")
+        for row in reader:
+            gsm = (row["gsm"] or "").strip().upper()
+            if not re.fullmatch(r"GSM\d+", gsm):
+                raise ValueError(f"第 {reader.line_num} 行 GSM 无效。")
+            if gsm in runs_by_gsm:
+                raise ValueError(f"第 {reader.line_num} 行：{gsm} 在清单中重复出现。")
+            runs = []
+            for item in (row["target_runs"] or "").split(";"):
+                run = item.strip().upper()
+                if not re.fullmatch(r"[SED]RR\d+", run):
+                    raise ValueError(f"第 {reader.line_num} 行 Run 无效。")
+                if run in owner and owner[run] != gsm:
+                    raise ValueError(f"{run} 对应多个 GSM，请核对清单。")
+                owner[run] = gsm
+                if run not in runs:
+                    runs.append(run)
+            runs_by_gsm[gsm] = runs
+    if not runs_by_gsm:
+        raise ValueError("编号清单为空。")
+    return list(runs_by_gsm), runs_by_gsm

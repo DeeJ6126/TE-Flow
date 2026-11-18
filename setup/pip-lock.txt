@@ -26,9 +26,9 @@ MarkupSafe==3.0.4
 mdit-py-plugins==0.6.1
 mdurl==0.1.2
 nbformat==5.11.1
-numpy @ file:[REDACTED:entropy:97].5.4-cp312-cp312-linux_x86_64.whl#sha256=178b27cd788a1fd47a724c4a529ca6054a72d95a6db1aea709048b7bbad60010
+numpy==2.5.4
 packaging==25.0
-pandas @ file:[REDACTED:entropy:85]
+pandas==3.0.6
 platformdirs==4.13.0
 pluggy==1.6.0
 psutil==7.2.2
@@ -39,14 +39,14 @@ Pygments==2.21.0
 pysam==0.24.1
 pytest==9.1.1
 pytest-asyncio==1.4.0
-python-dateutil @ file:[REDACTED:entropy:94]
+python-dateutil==2.9.0.post0
 PyYAML==6.0.3
 referencing==0.37.0
 requests==2.34.2
 rich==15.0.0
 rpds-py==2026.9.1
 setuptools==84.0.0
-six @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_six_1753199211/work
+six==1.17.0
 smart_open==7.7.1
 smmap==5.0.3
 snakemake==9.27.0
@@ -60,7 +60,6 @@ SQLAlchemy==2.0.36
 sqlmodel==0.0.37
 tabulate==0.10.0
 # Editable install (teflow==2.4.0)
--e /root/teflow
 tenacity==9.2.1
 TEtranscripts==2.2.4
 textual==6.12.0

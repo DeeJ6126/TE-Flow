@@ -112,6 +112,47 @@ class SnakefileDagTests(unittest.TestCase):
         (self.output / "samples.json").write_text(json.dumps({"accession": accession, "samples": samples}))
         return samples
 
+    def test_discard_validates_each_run_and_resumes_after_sibling_failure(self):
+        samples = self.write_layout_manifest({"SRR123456": "SINGLE", "SRR654321": "PAIRED"})
+        cfg = json.loads(self.config.read_text())
+        cfg["DISCARD_READS"] = True
+        self.config.write_text(json.dumps(cfg))
+        def invoke(*targets):
+            return subprocess.run([sys.executable, "-m", "snakemake", "--snakefile", str(self.snakefile),
+                "--directory", str(self.output), "--configfile", str(self.config), "--cores", "1",
+                "--rerun-incomplete", *map(str, targets)], capture_output=True, text=True, timeout=60)
+        tables = []
+        for run, sample in samples.items():
+            root = self.output / run
+            for name in ("qc", "align", "abundance"):
+                (root / name).mkdir(parents=True)
+            for i in ("1", "2"):
+                if sample.get("r" + i):
+                    (root / "qc" / f"{run}_clean_R{i}.fq.gz").write_bytes(b"clean")
+            for ext in ("html", "json"):
+                (root / "qc" / f"{run}.{ext}").write_text("qc")
+            (root / "align" / f"{run}Aligned.sortedByCoord.out.bam").write_bytes(b"bam")
+            tables.append(root / "abundance" / f"{run}.cntTable")
+            tables[-1].write_text("gene\tcount\nA\t1\n")
+        first, second = samples
+        result = invoke(tables[0].with_name(f".{first}.cleaned"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(Path(samples[first]["r1"]).exists())
+        self.assertTrue((self.output / first / "qc" / f"{first}.html").exists())
+        tables[1].write_text("invalid")
+        result = invoke(tables[1].with_name(f".{second}.cleaned"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(Path(samples[second]["r2"]).exists())
+        self.assertTrue((self.output / second / "align" / f"{second}Aligned.sortedByCoord.out.bam").exists())
+        tables[1].write_text("gene\tcount\nA\t3\n")
+        result = invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.output / "merged.count").read_text().splitlines()[-1], "A\t1\t3")
+        self.assertFalse(Path(samples[second]["r2"]).exists())
+        self.assertFalse((self.output / second / "qc" / f"{second}_clean_R2.fq.gz").exists())
+        result = invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_single_manifest_schedules_one_read_fastp_and_star_without_r2(self):
         self.write_layout_manifest({"SRR123456": "SINGLE"})
         output = self.dry_run()
@@ -170,6 +211,58 @@ class SnakefileDagTests(unittest.TestCase):
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("单双端类型", result.stdout)
+
+    def write_pooled_manifest(self, layout, discard=False):
+        config = json.loads(self.config.read_text())
+        config.update(ACCESSION="GSM777", RUNS=["SRR123456", "SRR654321"], DISCARD_READS=discard)
+        self.config.write_text(json.dumps(config))
+        samples = {}
+        for run in config["RUNS"]:
+            directory = self.raw / run
+            directory.mkdir()
+            names = [f"{run}.fastq.gz"] if layout == "SINGLE" else [f"{run}_{mate}.fastq.gz" for mate in (1, 2)]
+            for name in names:
+                with gzip.open(directory / name, "wt") as handle:
+                    handle.write("@read\nACGT\n+\nIIII\n")
+            samples[run] = {"library_layout": layout, "r1": str(directory / names[0]),
+                            "r2": str(directory / names[1]) if len(names) == 2 else None}
+        (self.output / "samples.json").write_text(json.dumps({
+            "accession": "GSM777", "samples": samples, "layout": "pooled",
+            "pooled": {"sample": "GSM777", "runs": list(samples), "library_layout": layout}}))
+        return samples
+
+    def test_pooled_gsm_concatenates_runs_then_counts_once_with_inferred_strand(self):
+        samples = self.write_pooled_manifest("PAIRED", discard=True)
+        output = self.dry_run()
+        for rule in ("pool_reads_paired", "quality_control", "star_align", "infer_strandedness", "te_count",
+                     "discard_run_reads"):
+            self.assertIn(f"rule {rule}:", output)
+        self.assertNotIn("rule merge_counts:", output)
+        self.assertNotIn("rule pool_reads_single:", output)
+        self.assertIn(str(self.output / "abundance" / "GSM777.cntTable"), output)
+        self.assertIn(str(self.output / "abundance" / ".GSM777.cleaned"), output)
+        self.assertIn(f"cat '{samples['SRR123456']['r1']}' '{samples['SRR654321']['r1']}'", output)
+        self.assertIn("--stranded", output)
+        self.assertNotIn("SRR123456.cntTable", output)
+
+    def test_pooled_single_end_uses_single_branch(self):
+        self.write_pooled_manifest("SINGLE")
+        output = self.dry_run()
+        self.assertIn("rule pool_reads_single:", output)
+        self.assertIn("rule quality_control_single:", output)
+        self.assertNotIn("rule pool_reads_paired:", output)
+        self.assertIn(str(self.output / "pooled" / "GSM777.fastq.gz"), output)
+
+    def test_runs_require_gsm_accession(self):
+        config = json.loads(self.config.read_text())
+        config["RUNS"] = ["SRR123456"]
+        self.config.write_text(json.dumps(config))
+        result = subprocess.run([
+            sys.executable, "-m", "snakemake", "--dry-run", "--snakefile", str(self.snakefile),
+            "--directory", str(self.output), "--configfile", str(self.config), "--cores", "10"
+        ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("RUNS 只能与 GSM", result.stdout)
 
     @unittest.skipUnless(os.name == "posix", "执行回归需要 Linux")
     def test_prepare_and_merge_scripts_execute_under_real_snakemake_injection(self):

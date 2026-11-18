@@ -12,3 +12,4 @@ scheduler_interval: 1
 download_retries: 3
 metadata_timeout: 180
 proxy_env: /home/codex/server-213-setup/proxy.env
+stranded: auto

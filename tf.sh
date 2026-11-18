@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -e
-if [ -f /home/codex/server-213-setup/proxy.env ]; then
-    source /home/codex/server-213-setup/proxy.env
-fi
-export TEFLOW_SETTINGS=/root/teflow/settings.yaml
-export PATH=/root/miniconda3/envs/TE/bin:$PATH
-exec /root/miniconda3/envs/TE/bin/tf "$@"
+APP=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
+export TEFLOW_SETTINGS="${TEFLOW_SETTINGS:-$APP/settings.yaml}"
+export PYTHONPATH="$APP${PYTHONPATH:+:$PYTHONPATH}"
+exec "${TEFLOW_PYTHON:-python}" -c 'from teflow.cli import shortcut_main; raise SystemExit(shortcut_main())' "$@"

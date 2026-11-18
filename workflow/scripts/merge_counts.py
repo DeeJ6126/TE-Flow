@@ -70,3 +70,6 @@ if "snakemake" in globals():
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"[TEFLOW] 合并完成: {summary['samples']} 个 Run，{summary['rows']} 个 gene/TE，{summary['output']}", flush=True)
+elif __name__ == "__main__":
+    import sys
+    read_count_table(Path(sys.argv[1]))
