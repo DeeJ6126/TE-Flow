@@ -1,10 +1,10 @@
-# TEflow 2.5
+# TEflow 2.6
 
 源码仓库：[DeeJ6126/TE-Flow](https://github.com/DeeJ6126/TE-Flow)（Private）。作者：DeeJ6126。
 
 部署在 **213 服务器的 /root/teflow**。CLI 和 TUI 共用一个持久化队列、自动资源调度器和 Snakemake 分析流程。
 
-当前版本为 **2.5.0**。仓库保存代码、环境定义和使用文档；原始数据、参考 index、运行状态、日志、验证产物和访问凭据保留在服务器本地。
+当前版本为 **2.6.0**。仓库保存代码、环境定义和使用文档；原始数据、参考 index、运行状态、日志、验证产物和访问凭据保留在服务器本地。
 
 当前分析模板适用于人类单端或双端 bulk RNA-seq，按每个 Run 的元数据自动选择；单细胞入口保留待补充。
 
@@ -77,7 +77,7 @@ TUI 可在启动前勾选「不保留FASTQ和BAM」，CLI 使用 `--discard-read
 tf -f /root/te_model_selection.csv -t bulk --discard-reads
 ```
 
-CSV 读取 `gsm` 和 `target_runs` 两列（多个 Run 用分号分隔）。**每个 GSM 是一个任务**：下载该 GSM 的全部 Run（每个 Run 放在 `<raw_root>/<GSM>/<Run>/`），按清单顺序把各 Run 的 FASTQ 直接拼接成一个样本（`pooled/<GSM>_R1/R2.fastq.gz`，单端为 `<GSM>.fastq.gz`），再做 fastp、STAR、链方向判断和 TEcount，结果为 `<output_root>/<GSM>/abundance/<GSM>.cntTable`。同一 GSM 内单双端不一致时在下载阶段报错，不做合并。同一批按清单顺序一次启动一个 GSM。重新提交 Run 列表不同的 GSM 会重新计数。GSM 与 Run 的对应写在任务目录的 samples.tsv。启用清理时，GSM 计数表通过格式和数值校验后，删除其全部 Run 的原始 FASTQ、合并 FASTQ、fastp 清洗 FASTQ 和 STAR BAM，保留计数表、质控报告、链方向判断、元数据和日志。计数失败时保留已有输入和中间数据，使用原命令重新提交即可续跑。提交整个 GSE 时仍会先下载该 GSE 的所有 Run，再逐 Run 计数和清理。默认关闭清理。
+CSV 读取 `gsm` 和 `target_runs` 两列（多个 Run 用分号分隔）。**每个 GSM 是一个任务**：下载该 GSM 的全部 Run（每个 Run 放在 `<raw_root>/<GSM>/<Run>/`），按清单顺序把各 Run 的 FASTQ 直接拼接成一个样本（`pooled/<GSM>_R1/R2.fastq.gz`，单端为 `<GSM>.fastq.gz`），再做 fastp、STAR、链方向判断和 TEcount，结果为 `<output_root>/<GSM>/abundance/<GSM>.cntTable`。同一 GSM 内单双端不一致时在下载阶段报错，不做合并。同一批按清单顺序启动 GSM；带 `--discard-reads` 时默认一次一个（可用 `-j` 调整，见「自动并行与资源」）。重新提交 Run 列表不同的 GSM 会重新计数。GSM 与 Run 的对应写在任务目录的 samples.tsv。启用清理时，GSM 计数表通过格式和数值校验后，删除其全部 Run 的原始 FASTQ、合并 FASTQ、fastp 清洗 FASTQ 和 STAR BAM，保留计数表、质控报告、链方向判断、元数据和日志。计数失败时保留已有输入和中间数据，使用原命令重新提交即可续跑。提交整个 GSE 时仍会先下载该 GSE 的所有 Run，再逐 Run 计数和清理。默认关闭清理。
 
 终端内显示动态概览；重定向到文件时只输出阶段、进度和状态变化。需要工具细节时使用 --verbose：
 
@@ -144,7 +144,21 @@ GEO 项目使用真实 GSE 编号作为目录名。解析严格遵循 **GSE 自�
 
 settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制及可用内存，并使用其 80%。为保留原模板 STAR 参数，每个项目采用保守的整工作流资源预约，默认 10 CPU、256000 MB；项目内部由 Snakemake 安排各步骤。预约量用于调度核算，不表示进程始终实际占用这么多内存。
 
-可以修改 settings.yaml 的 total_cores、total_mem_mb、resource_fraction；新一轮空闲批次重新检测预算。--cores N 可调整每项目 CPU 数，仍受共享总预算约束。
+可以修改 settings.yaml 的 total_cores、total_mem_mb、resource_fraction；新一轮空闲批次重新检测预算。
+
+**并发数与线程数**（2.6）：
+
+| 设置 | settings.yaml | 命令行 | 默认值（与 2.5 相同） |
+| --- | --- | --- | --- |
+| 每个项目（GSM）的线程数 | `threads` | `--threads N`（旧写法 `--cores N` 仍可用） | 10 |
+| 每批最多同时运行的项目数 | `max_parallel_jobs` | `-j N` / `--jobs N` | `auto`：带 `--discard-reads` 时逐个运行，否则按 CPU / 内存预算并行 |
+
+两者仍受共享 CPU / 内存总预算约束：每个项目预约 `threads` 个 CPU 和 `mem_mb`（默认 256000 MB），`-j` 设得再大也只能并行到预算允许的数量。并发上限按提交批次计算，写在每个任务记录的 `parallel_jobs` 中。例如：
+
+```bash
+tf -f /root/te_model_selection.csv -t bulk --discard-reads            # 逐个 GSM，10 线程
+tf -f /root/te_model_selection.csv -t bulk --discard-reads -j 2 --threads 16
+```
 
 ## 环境和维护
 
@@ -163,6 +177,8 @@ settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制�
 `setup/create-te.sh` 用于重建环境。安装前把 `TEFLOW_ENV_PREFIX` 设为目标环境目录，并使配置的 `environment` 与之对应；需要代理时把 `TEFLOW_PROXY_ENV` 设为代理配置文件。`setup/conda-explicit.txt` 和 `setup/pip-lock.txt` 保存软件版本记录。
 
 ## 实施与验证记录
+
+2.6：新增每批并发上限 `max_parallel_jobs` / `-j` 和 `--threads` 参数名，默认值保持 2.5 行为。
 
 2.5：选样 CSV 改为按 GSM 合并 Run 计数；新增链方向自动判断并传给 TEcount；清理与结果复用按 GSM 进行。2026-11-18 在 213 服务器 TE 环境完整回归 **354 项通过**（含 GSM 合并的单端 / 双端 DAG、清理、复用和链方向单元测试）。链方向脚本在 4 个已有 BAM（SRR7074294、SRR7074295、SRR22521672、SRR22521673）上判为不分链，同向约 50%；对 SRR22521672 分别统计 read1、read2 也各约 48% / 52%，确认为不分链建库而非翻转错误。尚缺链特异性样本的阳性对照，正式批量的第一批应检查判定分布。旧版代码备份在 /root/teflow-backups/20261118-pre-v2.5.tar.gz，旧的未提交改动另存于 git stash。
 

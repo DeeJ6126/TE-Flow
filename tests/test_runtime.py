@@ -347,3 +347,44 @@ def test_stranded_setting_reaches_workflow_config(manager):
     manager.settings["stranded"] = "reverse"
     job = manager.submit("SRR1", data_type="bulk")
     assert effective_config(manager, job)["STRANDED"] == "reverse"
+
+
+def test_parallel_jobs_default_auto_keeps_previous_behaviour(manager, tmp_path):
+    assert manager.settings["max_parallel_jobs"] == "auto"
+    source = tmp_path / "selection.csv"
+    source.write_text("gsm,target_runs\nGSM1,SRR1\nGSM2,SRR2\n")
+    jobs = manager.submit_many(str(source), data_type="bulk", discard_reads=True)
+    assert all(j["parallel_jobs"] == "auto" for j in jobs)
+    scheduler_tick(manager)
+    assert [manager.get_job(j["accession"])["status"] for j in jobs] == ["running", "queued"]
+    assert manager.get_job("GSM2")["queue_wait_reason"] == "等待本批上一个任务结束。"
+
+
+def test_parallel_jobs_caps_running_projects_per_batch(manager, tmp_path):
+    source = tmp_path / "selection.csv"
+    source.write_text("gsm,target_runs\nGSM1,SRR1\nGSM2,SRR2\nGSM3,SRR3\n")
+    manager.submit_many(str(source), data_type="bulk", discard_reads=True, parallel_jobs=2, cores=5)
+    scheduler_tick(manager)
+    statuses = [manager.get_job(g)["status"] for g in ("GSM1", "GSM2", "GSM3")]
+    assert statuses == ["running", "running", "queued"]
+    assert "最多 2 个" in manager.get_job("GSM3")["queue_wait_reason"]
+    manager.update("GSM1", status="succeeded")
+    scheduler_tick(manager)
+    assert manager.get_job("GSM3")["status"] == "running"
+
+
+def test_parallel_jobs_one_serialises_even_without_cleanup(manager):
+    manager.submit_many("GSE1,GSE2", data_type="bulk", parallel_jobs=1, cores=5)
+    scheduler_tick(manager)
+    assert [manager.get_job(a)["status"] for a in ("GSE1", "GSE2")] == ["running", "queued"]
+
+
+def test_parallel_jobs_setting_is_validated(manager):
+    for bad in (0, -1, "two", True, "1.5"):
+        with pytest.raises(ValueError, match="max_parallel_jobs"):
+            runtime.parse_parallel_jobs(bad)
+    assert runtime.parse_parallel_jobs("AUTO") == "auto" and runtime.parse_parallel_jobs("3") == 3
+    settings = yaml.safe_load(manager.settings_path.read_text())
+    settings["max_parallel_jobs"] = 3
+    manager.settings_path.write_text(yaml.safe_dump(settings))
+    assert JobManager(manager.settings_path).settings["max_parallel_jobs"] == 3

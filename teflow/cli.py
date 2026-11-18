@@ -38,7 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="数据类型：bulk；scrna 单细胞流程待配置")
     run.add_argument("--input-mode", choices=("auto", "accessions", "file"), default="auto",
                      help="输入方式，默认自动识别")
-    run.add_argument("--cores", type=_positive_integer, help="每个项目使用的 CPU 数，默认读取配置")
+    run.add_argument("--threads", "--cores", dest="cores", type=_positive_integer,
+                     help="每个项目（GSM）使用的线程数，默认读取 settings.yaml 的 threads")
+    run.add_argument("-j", "--jobs", dest="parallel_jobs", type=_positive_integer,
+                     help="本批最多同时运行的项目数，默认读取 settings.yaml 的 max_parallel_jobs")
     run.add_argument("--verbose", "-v", action="store_true", help="显示详细工具日志")
     run.add_argument("--discard-reads", action="store_true", help="每个 Run 计数成功后清理原始及清洗后的 FASTQ 和 BAM")
     submit = commands.add_parser("submit", help="提交单个编号后立即返回（维护入口）")
@@ -71,7 +74,8 @@ def shortcut_main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="tf",
         description="TE 工作流快捷入口；不带参数打开 TUI。多个项目自动按共享资源并行。",
-        epilog="示例：tf -a GSE219739 -t bulk；tf -f /root/geo_ids.txt -t bulk；tf status [编号]；tf logs <编号>",
+        epilog="示例：tf -a GSE219739 -t bulk；tf -f /root/selection.csv -t bulk --discard-reads -j 2 --threads 16；"
+               "tf status [编号]；tf logs <编号>",
     )
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument("-a", "--accession", help="单个编号或逗号分隔的多个编号")
@@ -79,13 +83,17 @@ def shortcut_main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("-t", "--type", dest="data_type", choices=DATA_TYPES,
                         help="运行时必须指定数据类型：bulk；scrna 单细胞流程待配置")
     parser.add_argument("--settings", help="应用 settings.yaml 路径")
-    parser.add_argument("--cores", type=_positive_integer, help="每个项目使用的 CPU 数，默认读取配置")
+    parser.add_argument("--threads", "--cores", dest="cores", type=_positive_integer,
+                        help="每个项目（GSM）使用的线程数，默认读取 settings.yaml 的 threads")
+    parser.add_argument("-j", "--jobs", dest="parallel_jobs", type=_positive_integer,
+                        help="本批最多同时运行的项目数，默认读取 settings.yaml 的 max_parallel_jobs")
     parser.add_argument("--verbose", "-v", action="store_true", help="显示详细工具日志")
     parser.add_argument("--discard-reads", action="store_true", help="每个 Run 计数成功后清理原始及清洗后的 FASTQ 和 BAM")
     args = parser.parse_args(argv)
     forwarded = [f"--settings={args.settings}"] if args.settings is not None else []
     if args.accession is None and args.file is None:
-        if args.cores is not None or args.verbose or args.discard_reads or args.data_type is not None:
+        if (args.cores is not None or args.parallel_jobs is not None or args.verbose or args.discard_reads
+                or args.data_type is not None):
             parser.error("请使用 -a 指定编号或 -f 指定 TXT；直接运行 tf 打开 TUI。")
         return main(forwarded)
     if args.data_type is None:
@@ -95,6 +103,8 @@ def shortcut_main(argv: Sequence[str] | None = None) -> int:
     forwarded.extend(["run", "--input-mode", mode, "--type", args.data_type])
     if args.cores is not None:
         forwarded.extend(["--cores", str(args.cores)])
+    if args.parallel_jobs is not None:
+        forwarded.extend(["--jobs", str(args.parallel_jobs)])
     if args.discard_reads:
         forwarded.append("--discard-reads")
     if args.verbose:
@@ -254,8 +264,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             validate_data_type(args.data_type)
         manager = JobManager(args.settings)
         if args.command == "run":
+            extra = {"discard_reads": True} if args.discard_reads else {}
+            if args.parallel_jobs is not None:
+                extra["parallel_jobs"] = args.parallel_jobs
             jobs = manager.submit_many(args.source, input_mode=args.input_mode, cores=args.cores,
-                                       data_type=args.data_type, **({"discard_reads": True} if args.discard_reads else {}))
+                                       data_type=args.data_type, **extra)
             return watch_jobs(manager, jobs, verbose=args.verbose, console=console)
         if args.command == "submit":
             print(json.dumps(manager.submit(args.accession, data_type=args.data_type, **({"discard_reads": True} if args.discard_reads else {})), ensure_ascii=False, indent=2))

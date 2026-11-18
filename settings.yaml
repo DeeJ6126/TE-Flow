@@ -3,7 +3,7 @@ output_root: /root/TEatlas/bulk_rna
 template_dir: /root/TEatlas/bulk_rna/SRA00000
 template_home: /root
 environment: /root/miniconda3/envs/TE
-threads: 10
+threads: 10                 # 每个项目（GSM）的线程数；命令行 --threads 覆盖
 mem_mb: 256000
 total_cores: auto
 total_mem_mb: auto
@@ -13,3 +13,4 @@ download_retries: 3
 metadata_timeout: 180
 proxy_env: /home/codex/server-213-setup/proxy.env
 stranded: auto
+max_parallel_jobs: auto      # 每批最多同时运行的项目数；auto = 带 --discard-reads 时逐个运行，否则按 CPU / 内存预算并行；命令行 -j 覆盖

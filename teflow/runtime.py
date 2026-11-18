@@ -13,6 +13,7 @@ import sys
 import time
 import traceback
 import uuid
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -188,6 +189,7 @@ class JobManager:
         self.settings["mem_mb"] = int(self.settings.get("mem_mb", 256000))
         if self.settings["threads"] < 1 or self.settings["mem_mb"] < 200000:
             raise ValueError("threads 必须大于零，单工作流内存预算至少 200000 MB，以容纳模板的 STAR 配置。")
+        self.settings["max_parallel_jobs"] = parse_parallel_jobs(self.settings.get("max_parallel_jobs", "auto"))
         self.state_dir = Path(self.settings.get("state_dir", self.app_dir / "state")).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.registry_path = self.state_dir / "jobs.json"
@@ -317,8 +319,10 @@ class JobManager:
         return self.submit_many(accession, input_mode="accessions", data_type=data_type, discard_reads=discard_reads)[0]
 
     def submit_many(self, source: str, input_mode: str = "auto", cores: int | None = None,
-                    *, data_type: str | None = None, discard_reads: bool = False) -> list[dict]:
+                    *, data_type: str | None = None, discard_reads: bool = False,
+                    parallel_jobs: int | str | None = None) -> list[dict]:
         data_type = validate_data_type(data_type)
+        parallel_jobs = parse_parallel_jobs(self.settings["max_parallel_jobs"] if parallel_jobs is None else parallel_jobs)
         accessions, runs_by_gsm = parse_batch(source, input_mode)
         if cores is not None and (isinstance(cores, bool) or int(cores) < 1):
             raise ValueError("cores 必须大于零。")
@@ -409,6 +413,7 @@ class JobManager:
                        "queued_at": timestamp(), "updated_at": timestamp(), "error": "",
                        "attempt": existing.get("attempt", 0) + 1 if existing else 1,
                        "batch_id": batch_id, "cores": allocated_cores, "mem_mb": self.settings["mem_mb"],
+                       "parallel_jobs": parallel_jobs,
                        "queue_wait_reason": "调度器将按共享 CPU / 内存预算自动启动。"}
                 registry["jobs"][accession] = job
                 self._job_save(job)
@@ -444,6 +449,29 @@ class JobManager:
         return "\n".join(text)
 
 
+def parse_parallel_jobs(value) -> int | str:
+    """`auto` keeps the pre-2.6 behaviour; a positive integer caps running projects per submitted batch."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    if isinstance(value, bool):
+        raise ValueError("max_parallel_jobs 必须是 auto 或正整数。")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_parallel_jobs 必须是 auto 或正整数。") from exc
+    if number < 1 or str(number) != str(value).strip():
+        raise ValueError("max_parallel_jobs 必须是 auto 或正整数。")
+    return number
+
+
+def batch_limit(job: dict) -> int | None:
+    """Running projects allowed per batch: auto = one at a time with read cleanup, otherwise only the resource budget."""
+    limit = job.get("parallel_jobs", "auto")
+    if limit == "auto":
+        return 1 if job.get("discard_reads") else None
+    return int(limit)
+
+
 def scheduler_tick(manager: JobManager) -> bool:
     """Atomically reserve resources and launch ready projects; return work remains."""
     with manager._lock():
@@ -460,11 +488,12 @@ def scheduler_tick(manager: JobManager) -> bool:
         free_cores, free_mem = available_capacity(registry["budget"], list(jobs.values()))
         queued = sorted((job for job in jobs.values() if job["status"] == "queued"),
                         key=lambda job: job.get("queued_at", job["created_at"]))
-        busy_batches = {j["batch_id"] for j in jobs.values() if j["status"] == "running" and j.get("discard_reads")}
+        running_in_batch = Counter(j["batch_id"] for j in jobs.values() if j["status"] == "running")
         for job in queued:
             reason = ""
-            if job.get("discard_reads") and job["batch_id"] in busy_batches:
-                reason = "等待本批上一个任务结束。"
+            limit = batch_limit(job)
+            if limit is not None and running_in_batch[job["batch_id"]] >= limit:
+                reason = "等待本批上一个任务结束。" if limit == 1 else f"等待本批并发名额（最多 {limit} 个同时运行）。"
             elif job["cores"] > free_cores or job["mem_mb"] > free_mem:
                 reason = f"等待资源：需 {job['cores']} CPU / {job['mem_mb']} MB；当前余量 {free_cores} CPU / {max(0, free_mem)} MB。"
             if reason:
@@ -482,8 +511,7 @@ def scheduler_tick(manager: JobManager) -> bool:
                         env=worker_environment(manager.settings), cwd=manager.app_dir, start_new_session=True)
                 job.update(status="running", pid=process.pid, pid_start=proc_start(process.pid),
                            attempt_started_at=timestamp(), step="准备解析项目", queue_wait_reason="")
-                if job.get("discard_reads"):
-                    busy_batches.add(job["batch_id"])
+                running_in_batch[job["batch_id"]] += 1
                 free_cores -= job["cores"]
                 free_mem -= job["mem_mb"]
             except Exception as exc:

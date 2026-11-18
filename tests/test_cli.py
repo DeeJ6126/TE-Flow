@@ -324,3 +324,25 @@ def test_cli_hints_use_tf_after_ctrl_c(monkeypatch):
     assert cli.watch_jobs(manager, manager.initial, console=console) == 130
     assert "tf status" in stream.getvalue()
     assert "teflow status" not in stream.getvalue()
+
+
+def test_threads_alias_and_jobs_are_forwarded(monkeypatch):
+    calls = []
+
+    class Recorder(FakeManager):
+        def submit_many(self, source, input_mode="auto", cores=None, *, data_type=None, **extra):
+            calls.append((source, input_mode, cores, data_type, extra))
+            return self.initial
+
+    manager = Recorder([job(status="succeeded", stage="done")])
+    monkeypatch.setattr(cli, "JobManager", lambda _: manager)
+    assert cli.shortcut_main(["-f", "/root/selection.csv", "-t", "bulk", "--discard-reads",
+                              "-j", "2", "--threads", "16"]) == 0
+    assert calls == [("/root/selection.csv", "file", 16, "bulk", {"discard_reads": True, "parallel_jobs": 2})]
+
+
+@pytest.mark.parametrize("arguments", [["-a", "GSE1", "-t", "bulk", "-j", "0"], ["-j", "2"]])
+def test_invalid_or_sourceless_jobs_rejected(arguments, monkeypatch):
+    monkeypatch.setattr(cli, "JobManager", lambda _: pytest.fail("runtime must not start"))
+    with pytest.raises(SystemExit):
+        cli.shortcut_main(arguments)
