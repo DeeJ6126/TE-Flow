@@ -156,7 +156,7 @@ settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制�
 - 调度记录：/root/teflow/state/jobs.json、scheduler.log
 - 旧版备份：/root/teflow-backups/20261014-v1.tar.gz
 
-**链方向**：每个样本比对后先运行 `infer_strandedness`，用最多 40 万条唯一比对的 reads 与基因 GTF 的 exon 方向比较（双端以 read1 为准），结果写入 `qc/<样本>.strandedness.json` 并传给 TEcount 的 `--stranded`：read1 与基因同向 ≥80% 为 forward，反向 ≥80% 为 reverse（dUTP / TruSeq Stranded 等），其余为 no（不分链；介于 60%–80% 时在 reason 中提示人工核对）。`settings.yaml` 的 `stranded` 默认 `auto`，也可固定为 `no`、`forward` 或 `reverse`。2.5 之前的结果使用 TEcount 默认的 `--stranded`（正向）；对反向链建库的旧结果需要重新计数。
+**链方向**：每个样本比对后先运行 `infer_strandedness`，用最多 40 万条唯一比对的 reads 与基因 GTF 的 exon 方向比较（双端以 read1 为准），结果写入 `qc/<样本>.strandedness.json` 并传给 TEcount 的 `--stranded`：read1 与基因同向 ≥80% 为 forward，反向 ≥80% 为 reverse（dUTP / TruSeq Stranded 等），其余为 no（不分链；介于 60%–80% 时在 reason 中提示人工核对）。`settings.yaml` 的 `stranded` 默认 `auto`，也可固定为 `no`、`forward` 或 `reverse`。2.5 之前的结果使用 TEcount 默认的 `--stranded no`（服务器上 TEcount 帮助写明 DEFAULT: no），即按不分链计数；链特异性建库的旧结果若需要区分正义 / 反义 TE，需要重新计数。
 
 单双端类型由公开元数据决定，无需另传参数。双端保持 fastp 两份输入/输出、STAR 两份 reads；单端使用一份输入/输出、STAR 一份 reads。TEcount 和合并表的处理流程保持一致；类型未知、配对缺失或单端多份 FASTQ 无法唯一确定时明确报错。单细胞分析尚未接入，待补充。
 
@@ -164,7 +164,7 @@ settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制�
 
 ## 实施与验证记录
 
-2.5：选样 CSV 改为按 GSM 合并 Run 计数；新增链方向自动判断并传给 TEcount；清理与结果复用按 GSM 进行。验证记录见本节末尾。
+2.5：选样 CSV 改为按 GSM 合并 Run 计数；新增链方向自动判断并传给 TEcount；清理与结果复用按 GSM 进行。2026-11-18 在 213 服务器 TE 环境完整回归 **354 项通过**（含 GSM 合并的单端 / 双端 DAG、清理、复用和链方向单元测试）。链方向脚本在 4 个已有 BAM（SRR7074294、SRR7074295、SRR22521672、SRR22521673）上判为不分链，同向约 50%；对 SRR22521672 分别统计 read1、read2 也各约 48% / 52%，确认为不分链建库而非翻转错误。尚缺链特异性样本的阳性对照，正式批量的第一批应检查判定分布。旧版代码备份在 /root/teflow-backups/20261118-pre-v2.5.tar.gz，旧的未提交改动另存于 git stash。
 
 测试包括真实 Linux 调度器/worker 多进程、资源排队与失败隔离、GEO 范围解析、Snakemake DAG、CLI 及 Textual Pilot。详细验证产物保存在服务器的 verification/ 目录。
 
