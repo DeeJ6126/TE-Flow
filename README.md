@@ -142,7 +142,7 @@ GEO 项目使用真实 GSE 编号作为目录名。解析严格遵循 **GSE 自�
 
 所有默认 CLI/TUI 入口共用 /root/teflow/state/jobs.json。输入清单先完整校验，再提交；调度器独立于界面运行，按共享 CPU、内存预算启动不同项目，资源不足时排队。一个项目失败会释放预约资源，其他项目继续。
 
-settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制及可用内存，并使用其 80%。为保留原模板 STAR 参数，每个项目采用保守的整工作流资源预约，默认 10 CPU、256000 MB；项目内部由 Snakemake 安排各步骤。预约量用于调度核算，不表示进程始终实际占用这么多内存。
+settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制及可用内存，并使用其 80%。为保留原模板 STAR 参数，每个项目采用保守的整工作流资源预约，默认 10 CPU、240000 MB（2.7 前为 256000；改为 240000 后 5 个项目可同时分析）；项目内部由 Snakemake 安排各步骤。预约量用于调度核算，不表示进程始终实际占用这么多内存。
 
 可以修改 settings.yaml 的 total_cores、total_mem_mb、resource_fraction；新一轮空闲批次重新检测预算。
 
@@ -153,7 +153,7 @@ settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制�
 | 每个项目（GSM）的线程数 | `threads` | `--threads N`（旧写法 `--cores N` 仍可用） | 10 |
 | 每批最多同时运行的项目数 | `max_parallel_jobs` | `-j N` / `--jobs N` | `auto`：带 `--discard-reads` 时逐个运行，否则按 CPU / 内存预算并行 |
 
-两者仍受共享 CPU / 内存总预算约束：每个项目预约 `threads` 个 CPU 和 `mem_mb`（默认 256000 MB），`-j` 设得再大也只能并行到预算允许的数量。并发上限按提交批次计算，写在每个任务记录的 `parallel_jobs` 中。例如：
+两者仍受共享 CPU / 内存总预算约束：每个项目预约 `threads` 个 CPU 和 `mem_mb`（默认 240000 MB），`-j` 设得再大也只能并行到预算允许的数量。并发上限按提交批次计算，写在每个任务记录的 `parallel_jobs` 中。例如：
 
 ```bash
 tf -f /root/te_model_selection.csv -t bulk --discard-reads            # 逐个 GSM，10 线程
@@ -186,9 +186,10 @@ tf -f /root/te_model_selection_run_order.csv -t bulk --discard-reads -j 3 --thre
 - 应用：/root/teflow
 - 环境：/root/miniconda3/envs/TE，Python 3.12
 - 原始模板：/root/TEatlas/bulk_rna/SRA00000
+- 原始数据：/root/nfsdata/TEatlas/bulk_rna；结果：/root/nfsdata/TEatlas/bulk_rna_results（2.7 起；之前的结果在 /root/TEatlas/bulk_rna）
 - 参考：沿用模板指定的 STAR index、基因 GTF、TE GTF
 - 代理配置：/home/codex/server-213-setup/proxy.env
-- 调度记录：/root/teflow/state/jobs.json、scheduler.log
+- 调度记录：/root/teflow/state/jobs.json（紧凑 JSON）、scheduler.log。几千个任务时 `tf -f` 的实时查看器每秒读一次整份记录，全量提交建议不挂查看器（见交接文档）
 - 旧版备份：/root/teflow-backups/20261014-v1.tar.gz
 
 **链方向**：每个样本比对后先运行 `infer_strandedness`，用最多 40 万条唯一比对的 reads 与基因 GTF 的 exon 方向比较（双端以 read1 为准），结果写入 `qc/<样本>.strandedness.json` 并传给 TEcount 的 `--stranded`：read1 与基因同向 ≥80% 为 forward，反向 ≥80% 为 reverse（dUTP / TruSeq Stranded 等），其余为 no（不分链；介于 60%–80% 时在 reason 中提示人工核对）。`settings.yaml` 的 `stranded` 默认 `auto`，也可固定为 `no`、`forward` 或 `reverse`。2.5 之前的结果使用 TEcount 默认的 `--stranded no`（服务器上 TEcount 帮助写明 DEFAULT: no），即按不分链计数；链特异性建库的旧结果若需要区分正义 / 反义 TE，需要重新计数。

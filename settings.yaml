@@ -1,10 +1,10 @@
 raw_root: /root/nfsdata/TEatlas/bulk_rna
-output_root: /root/TEatlas/bulk_rna
+output_root: /root/nfsdata/TEatlas/bulk_rna_results   # 2.7 起放 NFS：/root 分区只剩约 30 GB，并发时中间文件会撑满
 template_dir: /root/TEatlas/bulk_rna/SRA00000
 template_home: /root
 environment: /root/miniconda3/envs/TE
 threads: 10                 # 每个项目（GSM）的线程数；命令行 --threads 覆盖
-mem_mb: 256000
+mem_mb: 240000              # 每个项目的内存预约（MB）；240000 使 5 个项目可同时分析（总预算约 1205583 MB）
 total_cores: auto
 total_mem_mb: auto
 resource_fraction: 0.8

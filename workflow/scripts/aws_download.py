@@ -101,7 +101,7 @@ def _save_state(path: Path, size: int, chunk: int, done: set[int]) -> None:
 
 
 def parallel_download(url: str, dest: Path, size: int, connections: int, *, chunk=CHUNK_BYTES,
-                      chunk_tries=8, report=None, report_every=15.0, opener=None) -> None:
+                      chunk_tries=8, report=None, report_every=60.0, opener=None) -> None:
     """Fetch url into dest with `connections` concurrent range requests.
 
     Raises NetworkDown when chunks keep failing (finished chunks are kept for resume).

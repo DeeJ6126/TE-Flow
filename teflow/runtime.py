@@ -57,12 +57,13 @@ def timestamp() -> str:
     return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
 
 
-def atomic_json(path: Path, value: dict) -> None:
+def atomic_json(path: Path, value: dict, compact: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False, indent=2)
+            # The shared registry is rewritten on every update: keep it compact (8,000+ jobs).
+            json.dump(value, handle, ensure_ascii=False, **({"separators": (",", ":")} if compact else {"indent": 2}))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -244,7 +245,7 @@ class JobManager:
         return registry
 
     def _save(self, registry: dict) -> None:
-        atomic_json(self.registry_path, registry)
+        atomic_json(self.registry_path, registry, compact=True)
 
     def _job_save(self, job: dict) -> None:
         atomic_json(Path(job["job_dir"]) / "job.json", job)

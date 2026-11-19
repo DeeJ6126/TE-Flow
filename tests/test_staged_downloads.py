@@ -113,3 +113,10 @@ def test_download_options_without_source_are_rejected(monkeypatch):
     monkeypatch.setattr(cli, "main", lambda argv: 0)
     with pytest.raises(SystemExit):
         cli.shortcut_main(["--downloads", "4"])
+
+
+def test_registry_is_compact_and_job_records_stay_readable(manager):
+    job = manager.submit_many("GSE1", data_type="bulk")[0]
+    registry = manager.registry_path.read_text(encoding="utf-8")
+    assert "\n  " not in registry and '"GSE1"' in registry
+    assert "\n  " in (runtime.Path(job["job_dir"]) / "job.json").read_text(encoding="utf-8")
