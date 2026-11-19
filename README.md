@@ -142,7 +142,7 @@ GEO 项目使用真实 GSE 编号作为目录名。解析严格遵循 **GSE 自�
 
 所有默认 CLI/TUI 入口共用 /root/teflow/state/jobs.json。输入清单先完整校验，再提交；调度器独立于界面运行，按共享 CPU、内存预算启动不同项目，资源不足时排队。一个项目失败会释放预约资源，其他项目继续。
 
-settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制及可用内存，并使用其 80%。为保留原模板 STAR 参数，每个项目采用保守的整工作流资源预约，默认 10 CPU、240000 MB（2.7 前为 256000；改为 240000 后 5 个项目可同时分析）；项目内部由 Snakemake 安排各步骤。预约量用于调度核算，不表示进程始终实际占用这么多内存。
+settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制及可用内存，并使用其 80%。为保留原模板 STAR 参数，每个项目采用保守的整工作流资源预约，默认 10 CPU、220000 MB（2.7 前为 256000；2026-11-19 预算检测为 1,172,349 MB，220000 时 5 个分析加 8 个下载能同时运行）；项目内部由 Snakemake 安排各步骤。预约量用于调度核算，不表示进程始终实际占用这么多内存。
 
 可以修改 settings.yaml 的 total_cores、total_mem_mb、resource_fraction；新一轮空闲批次重新检测预算。
 
@@ -153,7 +153,7 @@ settings.yaml 的默认总预算自动检测 CPU affinity、Linux cgroup 限制�
 | 每个项目（GSM）的线程数 | `threads` | `--threads N`（旧写法 `--cores N` 仍可用） | 10 |
 | 每批最多同时运行的项目数 | `max_parallel_jobs` | `-j N` / `--jobs N` | `auto`：带 `--discard-reads` 时逐个运行，否则按 CPU / 内存预算并行 |
 
-两者仍受共享 CPU / 内存总预算约束：每个项目预约 `threads` 个 CPU 和 `mem_mb`（默认 240000 MB），`-j` 设得再大也只能并行到预算允许的数量。并发上限按提交批次计算，写在每个任务记录的 `parallel_jobs` 中。例如：
+两者仍受共享 CPU / 内存总预算约束：每个项目预约 `threads` 个 CPU 和 `mem_mb`（默认 220000 MB），`-j` 设得再大也只能并行到预算允许的数量。并发上限按提交批次计算，写在每个任务记录的 `parallel_jobs` 中。例如：
 
 ```bash
 tf -f /root/te_model_selection.csv -t bulk --discard-reads            # 逐个 GSM，10 线程

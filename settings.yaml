@@ -4,7 +4,7 @@ template_dir: /root/TEatlas/bulk_rna/SRA00000
 template_home: /root
 environment: /root/miniconda3/envs/TE
 threads: 10                 # 每个项目（GSM）的线程数；命令行 --threads 覆盖
-mem_mb: 240000              # 每个项目的内存预约（MB）；240000 使 5 个项目可同时分析（总预算约 1205583 MB）
+mem_mb: 220000              # 每个项目分析时的内存预约（MB，至少 200000 = STAR 资源）；220000 时 5 个分析 + 8 个下载可在约 1.17 TB 预算内同时运行
 total_cores: auto
 total_mem_mb: auto
 resource_fraction: 0.8
