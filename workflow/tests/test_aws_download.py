@@ -219,6 +219,46 @@ class PrepareAwsTests(unittest.TestCase):
             with self.assertRaises(KeyError):  # unrelated errors are not retried
                 prepare_samples.with_network(lambda: {}["x"], 600, io.StringIO(), sleep=lambda s: None)
 
+    def ena_record(self, payload):
+        import hashlib
+        return {"row": {"fastq_ftp": "ftp.sra.ebi.ac.uk/vol1/fastq/SRR1/SRR1.fastq.gz",
+                        "fastq_md5": hashlib.md5(payload).hexdigest(), "fastq_bytes": str(len(payload))},
+                "library_layout": "SINGLE"}
+
+    def gz(self):
+        buffer = io.BytesIO()
+        with gzip.GzipFile(fileobj=buffer, mode="wb") as handle:
+            handle.write(b"@r\nACGT\n+\nIIII\n")
+        return buffer.getvalue()
+
+    def test_ena_fallback_downloads_with_connections_and_checks_md5(self):
+        payload = self.gz()
+        record = self.ena_record(payload)
+        files = [{"name": "SRR1.fastq.gz", "bytes": len(payload), "mate": 1, "source": "ena-fastq"}]
+        urls = []
+
+        def fake(url, dest, size, connections, report=None):
+            urls.append((url, connections))
+            Path(dest).write_bytes(payload)
+        with patch.object(aws_download, "parallel_download", fake):
+            self.assertTrue(prepare_samples.download_run_ena_parallel("SRR1", record, self.run_dir, files, 16, 3, 0,
+                                                                      io.StringIO()))
+        self.assertEqual(urls, [("https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR1/SRR1.fastq.gz", 16)])
+        self.assertIn("SRR1", prepare_samples.logged_runs(self.run_dir / "success.log"))
+
+    def test_ena_fallback_rejects_md5_mismatch_and_skips_without_links(self):
+        payload = self.gz()
+        record = self.ena_record(payload)
+        record["row"]["fastq_md5"] = "0" * 32
+        files = [{"name": "SRR1.fastq.gz", "bytes": len(payload), "mate": 1, "source": "ena-fastq"}]
+        with patch.object(aws_download, "parallel_download",
+                          lambda url, dest, size, connections, report=None: Path(dest).write_bytes(payload)):
+            with self.assertRaisesRegex(RuntimeError, "ENA 下载"):
+                prepare_samples.download_run_ena_parallel("SRR1", record, self.run_dir, files, 4, 2, 0, io.StringIO())
+        converted = prepare_samples.converted_files("SRR1", "SINGLE")
+        self.assertFalse(prepare_samples.download_run_ena_parallel("SRR1", {"row": {}}, self.run_dir, converted,
+                                                                   4, 2, 0, io.StringIO()))
+
 
 if __name__ == "__main__":
     unittest.main()

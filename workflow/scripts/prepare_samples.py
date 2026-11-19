@@ -5,6 +5,7 @@ so iSeq's success/failure logs are never modified by simultaneous iSeq calls.
 """
 import csv
 import gzip
+import hashlib
 import io
 import json
 import os
@@ -711,6 +712,73 @@ def converted_files(run: str, layout: str) -> list[dict]:
             for mate in (1, 2)]
 
 
+def ena_links(row: dict) -> dict[str, tuple[str, str]]:
+    """FASTQ file name -> (HTTPS URL, MD5) from the ENA metadata row."""
+    links = [link.strip() for link in str(row.get("fastq_ftp", "")).split(";") if link.strip()]
+    md5s = [value.strip() for value in str(row.get("fastq_md5", "")).split(";")]
+    result = {}
+    for i, link in enumerate(links):
+        url = link if "://" in link else "https://" + link
+        result[_safe_fastq_name(url)] = (url, md5s[i] if i < len(md5s) and len(links) == len(md5s) else "")
+    return result
+
+
+def file_md5(path: Path) -> str:
+    digest = hashlib.md5()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download_run_ena_parallel(run: str, record: dict, run_dir: Path, files: list[dict], connections: int,
+                              retries: int, network_wait: float, log, report=None) -> bool:
+    """ENA .fastq.gz over HTTPS with several connections per file; size + MD5 + gzip checked.
+
+    Returns False when ENA has no FASTQ links for this Run (the caller then uses iSeq).
+    """
+    links = ena_links(record["row"])
+    if not files or any(item["source"] != "ena-fastq" or item["name"] not in links for item in files):
+        return False
+    attempts, outages = 0, 0
+
+    def say(text):
+        log_message(text, log)
+
+    while True:
+        try:
+            for item in files:
+                target = run_dir / item["name"]
+                url, md5 = links[item["name"]]
+                if network_wait > 0:
+                    aws_download.wait_for_network(network_wait, say, probe=ENA_PROBE)
+                say(f"{run}: ENA 下载 {item['name']} {item['bytes'] / 1024**3:.2f} GiB，{connections} 个连接。")
+                aws_download.parallel_download(url, target, item["bytes"], connections, report=report)
+                if md5 and file_md5(target) != md5.lower():
+                    target.unlink(missing_ok=True)
+                    raise ValueError(f"{item['name']}: MD5 与 ENA 元数据不符。")
+                validate_fastq(target, item)
+            with (run_dir / "success.log").open("a", encoding="utf-8") as handle:
+                handle.write(f"ena-parallel {run}\n")
+            return True
+        except aws_download.NetworkDown as exc:
+            outages += 1
+            if network_wait <= 0 or outages > 50:
+                raise RuntimeError(f"{run}: 下载中断：{exc}") from exc
+            say(f"{run}: {exc}；等待网络后续传。")
+            aws_download.wait_for_network(network_wait, say, probe=ENA_PROBE)
+        except (OSError, ValueError) as exc:
+            if network_wait > 0 and not aws_download.network_ok(ENA_PROBE):
+                outages += 1
+                if outages > 50:
+                    raise RuntimeError(f"{run}: 网络反复中断：{exc}") from exc
+                continue
+            attempts += 1
+            say(f"{run}: ENA 多连接下载失败（{attempts}/{retries}）：{exc}")
+            if attempts >= retries:
+                raise RuntimeError(f"{run}: {retries} 次 ENA 下载后仍未完成；已下载部分保留，可重试。{exc}") from exc
+
+
 def download_run_aws(run: str, record: dict, run_dir: Path, files: list[dict], threads: int,
                      connections: int, retries: int, network_wait: float, log, report=None) -> None:
     """AWS SRA object -> multi-connection download -> fasterq-dump -> validated FASTQ.gz.
@@ -885,9 +953,12 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
                 except aws_download.NotOnAws as exc:
                     log_message(f"{exc}；改用 ENA。", log)
                     files = record["files"] = record["ena_files"]
+                    if connections > 1 and download_run_ena_parallel(run, record, run_dir, files, connections,
+                                                                     retries, network_wait, log, report):
+                        already_complete, status = True, "downloaded"
             if already_complete:
                 log_message(f"Run {index}/{len(records)} {run}: "
-                            f"{'复用已完成 FASTQ' if status == 'reused' else 'AWS 下载并转换完成'}。", log)
+                            f"{'复用已完成 FASTQ' if status == 'reused' else '下载完成'}。", log)
             else:
                 status, last_error = "downloaded", None
                 for attempt in range(1, retries + 1):
