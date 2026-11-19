@@ -1,4 +1,4 @@
-"""Accession → iSeq SINGLE/PAIRED FASTQ → fastp → STAR → strandedness → TEcount → merged.count.
+"""Accession → iSeq (ENA) or AWS SRA SINGLE/PAIRED FASTQ → fastp → STAR → strandedness → TEcount → merged.count.
 
 With RUNS (a GSM from a selection CSV) all Runs of the GSM are concatenated into one
 sample named after the GSM before QC; the result is abundance/<GSM>.cntTable.
@@ -149,7 +149,11 @@ checkpoint prepare_samples:
         retries=int(config.get("DOWNLOAD_RETRIES", 3)),
         metadata_timeout=int(config.get("METADATA_TIMEOUT", 180)),
         output_space_multiplier=float(config.get("OUTPUT_SPACE_MULTIPLIER", 4)),
-        runs=RUNS
+        runs=RUNS,
+        download_source=str(config.get("DOWNLOAD_SOURCE", "ena")),
+        connections=int(config.get("DOWNLOAD_CONNECTIONS", 1)),
+        network_wait=float(config.get("NETWORK_WAIT", 0)),
+        script_dir=SCRIPT_DIR
     threads:
         min(THREADS, 8)
     resources:

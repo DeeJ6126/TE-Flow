@@ -1,10 +1,10 @@
-# TEflow 2.6
+# TEflow 2.7
 
 源码仓库：[DeeJ6126/TE-Flow](https://github.com/DeeJ6126/TE-Flow)（Private）。作者：DeeJ6126。
 
 部署在 **213 服务器的 /root/teflow**。CLI 和 TUI 共用一个持久化队列、自动资源调度器和 Snakemake 分析流程。
 
-当前版本为 **2.6.0**。仓库保存代码、环境定义和使用文档；原始数据、参考 index、运行状态、日志、验证产物和访问凭据保留在服务器本地。
+当前版本为 **2.7.0**。仓库保存代码、环境定义和使用文档；原始数据、参考 index、运行状态、日志、验证产物和访问凭据保留在服务器本地。
 
 当前分析模板适用于人类单端或双端 bulk RNA-seq，按每个 Run 的元数据自动选择；单细胞入口保留待补充。
 
@@ -160,6 +160,27 @@ tf -f /root/te_model_selection.csv -t bulk --discard-reads            # 逐个 G
 tf -f /root/te_model_selection.csv -t bulk --discard-reads -j 2 --threads 16
 ```
 
+**边下载边分析与 AWS 多连接下载**（2.7）：
+
+213 服务器经反向隧道上网，校园网对每个 TCP 连接限速（约 40–70 KB/s），总带宽随连接数近似线性增加（2026-11-19 实测：经一体机通道 8 / 32 / 64 / 128 个连接分别约 0.56 / 1.86 / 2.98 / 5.20 MB/s）。因此 2.7 把一个文件拆成多个分段同时下载，并把下载与分析分开调度：
+
+| 设置 | settings.yaml | 命令行 | 默认值（保持 2.6 行为） |
+| --- | --- | --- | --- |
+| 下载来源 | `download_source` | `--source ena\|aws` | `ena`：iSeq 从 ENA 取 `.fastq.gz` |
+| 每个文件的连接数（aws） | `download_connections` | `--connections N` | 1 |
+| 最多同时下载的项目数 | `max_parallel_downloads` | `--downloads N` | 0：在项目内下载，不分开调度 |
+| 网络中断时最多等待 | `network_wait_minutes` | `--wait-network 分钟` | 0：立即失败 |
+
+- `aws`：从 `https://sra-pub-run-odp.s3.amazonaws.com/sra/<Run>/<Run>` 分段下载 `.sra`（`workflow/scripts/aws_download.py`，仅用 Python 标准库，经 `proxy_env` 代理；已完成分段记录在 `<Run>.sra.chunks.json`，中断后续传），再 `fasterq-dump --split-3`（与 ENA FASTQ 一样不含技术 reads，双端丢弃无配对 reads）并用 pigz 压缩；spot 数须与元数据 `read_count` 一致，随后完整读一遍 gzip 校验，删除 `.sra`。AWS 上没有该 Run 时自动改用 ENA（iSeq）。服务器上的 axel 经 HTTP 代理访问 HTTPS 会返回 301，aria2c 未安装，所以没有用它们。
+- `--downloads N`（N > 0）：每个项目先进入下载阶段，只预约 min(threads, 8) 个 CPU 和 8000 MB，最多 N 个项目同时下载；下载完成后释放预约、重新排队，按 `threads` / `mem_mb` 预约后进入分析（受 `-j` 限制，优先于新的下载）。下载完成待分析的项目达到 N 个时暂缓继续下载，避免原始数据堆积。
+- `--wait-network M`：元数据请求或下载失败且网络探测不通时，每 60 秒检查一次，最长等 M 分钟，恢复后续传，不消耗重试次数。
+- 总连接数约为 `--downloads × --connections`。
+
+```bash
+# 全量：3 个 GSM 同时分析（每个 20 线程），8 个同时下载，每个文件 16 个连接（约 128 个连接），断网最多等 12 小时
+tf -f /root/te_model_selection_run_order.csv -t bulk --discard-reads -j 3 --threads 20 --source aws --downloads 8 --connections 16 --wait-network 720
+```
+
 ## 环境和维护
 
 - 应用：/root/teflow
@@ -177,6 +198,8 @@ tf -f /root/te_model_selection.csv -t bulk --discard-reads -j 2 --threads 16
 `setup/create-te.sh` 用于重建环境。安装前把 `TEFLOW_ENV_PREFIX` 设为目标环境目录，并使配置的 `environment` 与之对应；需要代理时把 `TEFLOW_PROXY_ENV` 设为代理配置文件。`setup/conda-explicit.txt` 和 `setup/pip-lock.txt` 保存软件版本记录。
 
 ## 实施与验证记录
+
+2.7：AWS 多连接下载（`--source aws --connections`）、下载与分析分开调度（`--downloads`）、断网等待（`--wait-network`），默认值保持 2.6 行为；新增 22 项测试（分段下载、续传、断网等待、SRA 转换校验与 ENA 回退、分阶段调度、CLI 转发）。2026-11-18 的试点中 GSM4315365 完成（45 分钟，链方向 forward 94%，FASTQ / BAM 已清理），其余 9 个在隧道断开后数秒内于元数据阶段失败，原因是网络而非流程。
 
 2.6：新增每批并发上限 `max_parallel_jobs` / `-j` 和 `--threads` 参数名，默认值保持 2.5 行为。2026-11-18 在 213 服务器 TE 环境完整回归 **361 项通过**（含 7 项新增的并发 / CLI 测试；TUI 测试 `test_default_output_toggle_input_and_restore_file_page` 曾偶发失败一次，单独重跑与再次全量均通过）。当前下载为 iSeq `-g -r https` 从 ENA 取 `.fastq.gz`，单连接经代理约 0.8 MB/s；NCBI SRA 的 AWS 公开地址经代理约 2.1 MB/s（`.sra`，需转换），是否切换待定。
 

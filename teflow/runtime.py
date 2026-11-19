@@ -45,6 +45,10 @@ class Stage(str, enum.Enum):
 
 
 ACTIVE = {"queued", "running"}
+DOWNLOAD_SOURCES = ("ena", "aws")
+# Download phase reservation: prepare_samples uses at most 8 threads (SRA conversion).
+DOWNLOAD_CORES = 8
+DOWNLOAD_MEM_MB = 8000
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
 PROXY_KEYS = {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}
 
@@ -190,6 +194,12 @@ class JobManager:
         if self.settings["threads"] < 1 or self.settings["mem_mb"] < 200000:
             raise ValueError("threads 必须大于零，单工作流内存预算至少 200000 MB，以容纳模板的 STAR 配置。")
         self.settings["max_parallel_jobs"] = parse_parallel_jobs(self.settings.get("max_parallel_jobs", "auto"))
+        download = parse_download_options(self.settings.get("download_source", "ena"),
+                                          self.settings.get("download_connections", 1),
+                                          self.settings.get("max_parallel_downloads", 0),
+                                          self.settings.get("network_wait_minutes", 0))
+        self.settings.update(download_source=download[0], download_connections=download[1],
+                             max_parallel_downloads=download[2], network_wait_minutes=download[3])
         self.state_dir = Path(self.settings.get("state_dir", self.app_dir / "state")).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.registry_path = self.state_dir / "jobs.json"
@@ -320,9 +330,15 @@ class JobManager:
 
     def submit_many(self, source: str, input_mode: str = "auto", cores: int | None = None,
                     *, data_type: str | None = None, discard_reads: bool = False,
-                    parallel_jobs: int | str | None = None) -> list[dict]:
+                    parallel_jobs: int | str | None = None, download_source: str | None = None,
+                    connections: int | None = None, downloads: int | None = None,
+                    network_wait: float | None = None) -> list[dict]:
         data_type = validate_data_type(data_type)
         parallel_jobs = parse_parallel_jobs(self.settings["max_parallel_jobs"] if parallel_jobs is None else parallel_jobs)
+        pick = lambda value, key: self.settings[key] if value is None else value
+        download_source, connections, downloads, network_wait = parse_download_options(
+            pick(download_source, "download_source"), pick(connections, "download_connections"),
+            pick(downloads, "max_parallel_downloads"), pick(network_wait, "network_wait_minutes"))
         accessions, runs_by_gsm = parse_batch(source, input_mode)
         if cores is not None and (isinstance(cores, bool) or int(cores) < 1):
             raise ValueError("cores 必须大于零。")
@@ -414,6 +430,9 @@ class JobManager:
                        "attempt": existing.get("attempt", 0) + 1 if existing else 1,
                        "batch_id": batch_id, "cores": allocated_cores, "mem_mb": self.settings["mem_mb"],
                        "parallel_jobs": parallel_jobs,
+                       "download_source": download_source, "download_connections": connections,
+                       "download_jobs": downloads, "network_wait_minutes": network_wait,
+                       "phase": "download" if downloads else None,
                        "queue_wait_reason": "调度器将按共享 CPU / 内存预算自动启动。"}
                 registry["jobs"][accession] = job
                 self._job_save(job)
@@ -464,6 +483,20 @@ def parse_parallel_jobs(value) -> int | str:
     return number
 
 
+def parse_download_options(source, connections, downloads, network_wait) -> tuple[str, int, int, float]:
+    """Defaults (ena, 1, 0, 0) keep the pre-2.7 behaviour: iSeq inside each project, no waiting."""
+    source = str(source).strip().lower()
+    if source not in DOWNLOAD_SOURCES:
+        raise ValueError(f"download_source 必须是 {' 或 '.join(DOWNLOAD_SOURCES)}。")
+    try:
+        connections, downloads, network_wait = int(connections), int(downloads), float(network_wait)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("download_connections、max_parallel_downloads、network_wait_minutes 必须是数字。") from exc
+    if connections < 1 or downloads < 0 or network_wait < 0:
+        raise ValueError("download_connections 至少为 1，max_parallel_downloads 和 network_wait_minutes 不能为负。")
+    return source, connections, downloads, network_wait
+
+
 def batch_limit(job: dict) -> int | None:
     """Running projects allowed per batch: auto = one at a time with read cleanup, otherwise only the resource budget."""
     limit = job.get("parallel_jobs", "auto")
@@ -486,16 +519,27 @@ def scheduler_tick(manager: JobManager) -> bool:
             registry["budget"] = detect_budget(manager.settings)
             changed = True
         free_cores, free_mem = available_capacity(registry["budget"], list(jobs.values()))
+        # Downloaded projects waiting for analysis go first; downloads follow in submission order.
         queued = sorted((job for job in jobs.values() if job["status"] == "queued"),
-                        key=lambda job: job.get("queued_at", job["created_at"]))
-        running_in_batch = Counter(j["batch_id"] for j in jobs.values() if j["status"] == "running")
+                        key=lambda job: (job.get("phase") != "analyze", job.get("queued_at", job["created_at"])))
+        running_in_batch = Counter(j["batch_id"] for j in jobs.values()
+                                   if j["status"] == "running" and j.get("phase") != "download")
+        downloading = sum(j["status"] == "running" and j.get("phase") == "download" for j in jobs.values())
+        downloaded = sum(j["status"] == "queued" and j.get("phase") == "analyze" for j in jobs.values())
         for job in queued:
             reason = ""
             limit = batch_limit(job)
-            if limit is not None and running_in_batch[job["batch_id"]] >= limit:
+            fetching = job.get("phase") == "download"
+            cores = min(job["cores"], DOWNLOAD_CORES) if fetching else job["cores"]
+            memory = DOWNLOAD_MEM_MB if fetching else job["mem_mb"]
+            if fetching and downloading >= job["download_jobs"]:
+                reason = f"等待下载名额（最多 {job['download_jobs']} 个同时下载）。"
+            elif fetching and downloaded >= job["download_jobs"]:
+                reason = f"已有 {downloaded} 个项目下载完成等待分析，暂缓下载。"
+            elif not fetching and limit is not None and running_in_batch[job["batch_id"]] >= limit:
                 reason = "等待本批上一个任务结束。" if limit == 1 else f"等待本批并发名额（最多 {limit} 个同时运行）。"
-            elif job["cores"] > free_cores or job["mem_mb"] > free_mem:
-                reason = f"等待资源：需 {job['cores']} CPU / {job['mem_mb']} MB；当前余量 {free_cores} CPU / {max(0, free_mem)} MB。"
+            elif cores > free_cores or memory > free_mem:
+                reason = f"等待资源：需 {cores} CPU / {memory} MB；当前余量 {free_cores} CPU / {max(0, free_mem)} MB。"
             if reason:
                 if job.get("queue_wait_reason") != reason:
                     job["queue_wait_reason"] = reason
@@ -510,10 +554,17 @@ def scheduler_tick(manager: JobManager) -> bool:
                         stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                         env=worker_environment(manager.settings), cwd=manager.app_dir, start_new_session=True)
                 job.update(status="running", pid=process.pid, pid_start=proc_start(process.pid),
-                           attempt_started_at=timestamp(), step="准备解析项目", queue_wait_reason="")
-                running_in_batch[job["batch_id"]] += 1
-                free_cores -= job["cores"]
-                free_mem -= job["mem_mb"]
+                           attempt_started_at=job.get("attempt_started_at") if job.get("phase") == "analyze"
+                           else timestamp(), step="准备解析项目" if fetching or not job.get("phase") else "准备分析",
+                           queue_wait_reason="", reserved_cores=cores, reserved_mem_mb=memory)
+                if fetching:
+                    downloading += 1
+                else:
+                    running_in_batch[job["batch_id"]] += 1
+                    if job.get("phase") == "analyze":
+                        downloaded -= 1
+                free_cores -= cores
+                free_mem -= memory
             except Exception as exc:
                 job.update(status="failed", error=f"后台启动失败：{exc}", exit_code=1, finished_at=timestamp())
             job["updated_at"] = timestamp()
@@ -562,7 +613,10 @@ def effective_config(manager: JobManager, job: dict) -> dict:
                    "METADATA_TIMEOUT": int(manager.settings.get("metadata_timeout", 180)),
                    "GSM": job.get("gsm") or "", "RUNS": list(job.get("runs") or []),
                    "STRANDED": str(manager.settings.get("stranded", "auto")),
-                   "DISCARD_READS": bool(job.get("discard_reads")), "OUTPUT_SPACE_MULTIPLIER": 4})
+                   "DISCARD_READS": bool(job.get("discard_reads")), "OUTPUT_SPACE_MULTIPLIER": 4,
+                   "DOWNLOAD_SOURCE": job.get("download_source", "ena"),
+                   "DOWNLOAD_CONNECTIONS": int(job.get("download_connections", 1)),
+                   "NETWORK_WAIT": float(job.get("network_wait_minutes", 0)) * 60})
     return config
 
 
@@ -624,7 +678,8 @@ def run_worker(settings_path: str, accession: str) -> int:
     environment = worker_environment(manager.settings)
     process = None
     activity = ActivityRecorder(job, output / ".teflow-activity.jsonl")
-    activity.begin()
+    if job.get("phase") != "analyze":
+        activity.begin()
     reported_failure = None
     reported_detail = ""
     previous_term = signal.getsignal(signal.SIGTERM)
@@ -633,8 +688,12 @@ def run_worker(settings_path: str, accession: str) -> int:
     signal.signal(signal.SIGTERM, interrupted)
     try:
         validate_data_type(job.get("data_type", "bulk"))
-        manager.update(accession, status="running", stage="metadata", step="解析项目", error="",
-                       failure=None, error_detail="")
+        if job.get("phase") == "analyze":
+            manager.update(accession, status="running", stage="analyze", step="准备分析", error="",
+                           failure=None, error_detail="")
+        else:
+            manager.update(accession, status="running", stage="metadata", step="解析项目", error="",
+                           failure=None, error_detail="")
         for program in ("iseq", "snakemake", "fastp", "STAR", "TEcount", "zcat"):
             if not shutil.which(program, path=environment["PATH"]):
                 raise RuntimeError(f"TE 环境缺少 {program}。")
@@ -643,13 +702,19 @@ def run_worker(settings_path: str, accession: str) -> int:
         manifest = output / "samples.json"
         if manifest.exists() and not raw_manifest_valid(job):
             manifest.rename(manifest.with_name(f"samples.json.incomplete.{uuid.uuid4().hex[:8]}"))
+        fetching = job.get("phase") == "download"
+        cores = job.get("reserved_cores") or job.get("cores", manager.settings["threads"])
+        memory = job.get("reserved_mem_mb") or job.get("mem_mb", manager.settings["mem_mb"])
         command = [str(Path(manager.settings["environment"]) / "bin" / "snakemake"),
                    "--snakefile", str(manager.app_dir / "workflow" / "Snakefile"), "--directory", str(output),
-                   "--configfile", str(output / "config.yaml"), "--cores", str(job.get("cores", manager.settings["threads"])),
+                   "--configfile", str(output / "config.yaml"), "--cores", str(cores),
                    "--resources", "star_slots=1", "download_slots=1",
-                   f"mem_mb={job.get('mem_mb', manager.settings['mem_mb'])}", "--rerun-incomplete", "--printshellcmds"]
-        if job.get("discard_reads"):
+                   f"mem_mb={memory}", "--rerun-incomplete", "--printshellcmds"]
+        if job.get("discard_reads") and not fetching:
             command.append("--keep-going")
+        if fetching:
+            # Download phase: only the checkpoint; analysis is scheduled separately.
+            command.append(str(manifest))
         rule_steps = {"pool_reads_paired": "合并 FASTQ", "pool_reads_single": "合并 FASTQ", "quality_control": "质控",
                       "quality_control_single": "质控", "star_align": "比对", "infer_strandedness": "判断链方向",
                       "te_count": "计数"}
@@ -694,6 +759,17 @@ def run_worker(settings_path: str, accession: str) -> int:
         exit_code = process.wait()
         if exit_code:
             raise RuntimeError(_failure_message(output, exit_code, manager.get_job(accession)))
+        if fetching:
+            if not raw_manifest_valid(job):
+                raise RuntimeError(f"下载阶段结束，但样本清单不完整：{manifest}")
+            current = manager.get_job(accession)
+            # Release the light reservation; the scheduler starts analysis when CPU / memory allow.
+            manager.update(accession, status="queued", phase="analyze", stage="download",
+                           step="下载完成，等待分析资源", pid=None, pid_start=None, snakemake_pid=None,
+                           snakemake_pid_start=None, reserved_cores=None, reserved_mem_mb=None,
+                           downloaded_runs=current.get("total_runs", 0),
+                           queue_wait_reason="下载完成，等待分析资源。")
+            return 0
         result = Path(job["result_path"])
         if not result.is_file() or not result.stat().st_size:
             raise RuntimeError(f"流程退出成功，但未生成预期结果：{result}")

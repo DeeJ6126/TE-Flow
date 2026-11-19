@@ -14,3 +14,7 @@ metadata_timeout: 180
 proxy_env: /home/codex/server-213-setup/proxy.env
 stranded: auto
 max_parallel_jobs: auto      # 每批最多同时运行的项目数；auto = 带 --discard-reads 时逐个运行，否则按 CPU / 内存预算并行；命令行 -j 覆盖
+download_source: ena         # ena = iSeq 从 ENA 下载 FASTQ；aws = NCBI SRA 的 AWS 公开地址多连接下载后转换；命令行 --source 覆盖
+download_connections: 1      # aws 下载时每个文件的连接数（校园网按连接限速）；命令行 --connections 覆盖
+max_parallel_downloads: 0    # 0 = 在项目内下载（2.6 行为）；N = 下载与分析分开调度，最多 N 个项目同时下载；命令行 --downloads 覆盖
+network_wait_minutes: 0      # 网络中断时最多等待的分钟数，恢复后继续；0 = 立即失败（2.6 行为）；命令行 --wait-network 覆盖

@@ -50,6 +50,7 @@ def detect_budget(settings: dict) -> dict:
 
 
 def available_capacity(budget: dict, jobs: list[dict]) -> tuple[int, int]:
+    """A running job holds what it reserved at launch (download phase: a small share)."""
     running = [job for job in jobs if job["status"] == "running"]
-    return (budget["cores"] - sum(int(job["cores"]) for job in running),
-            budget["mem_mb"] - sum(int(job["mem_mb"]) for job in running))
+    return (budget["cores"] - sum(int(job.get("reserved_cores") or job["cores"]) for job in running),
+            budget["mem_mb"] - sum(int(job.get("reserved_mem_mb") or job["mem_mb"]) for job in running))

@@ -26,6 +26,11 @@ from pathlib import Path
 
 from teflow.failures import KnownFailure, known_failure, website_failure
 
+try:
+    import aws_download
+except ImportError:  # Snakemake runs a copy of this script; its directory is added below.
+    aws_download = None
+
 ACCESSION_PATTERN = re.compile(
     r"(?:[SED]R[APXS]\d+|[SED]RR\d+|PRJ[END][A-Z]\d+|SAM[END][A-Z]?\d+|GSE\d+|GSM\d+)"
 )
@@ -661,9 +666,95 @@ def download_lock(samples_dir: Path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+ENA_PROBE = "https://www.ebi.ac.uk/ena/portal/api/"
+DOWNLOAD_SOURCES = {"ena", "aws"}
+
+
+def with_network(action, network_wait: float, log, probe=ENA_PROBE, rounds=20):
+    """Run action; if it fails while the network is down, wait for it and try again.
+
+    With network_wait=0 (the default) errors propagate unchanged, as before 2.7.
+    """
+    for _ in range(rounds):
+        try:
+            return action()
+        except Exception as exc:
+            if network_wait <= 0 or aws_download.network_ok(probe):
+                raise
+            log_message(f"网络中断（{type(exc).__name__}: {exc}），等待恢复后重试。", log)
+            progress("metadata", step="等待网络恢复")
+            aws_download.wait_for_network(network_wait, lambda text: log_message(text, log), probe=probe)
+    return action()
+
+
+def converted_files(run: str, layout: str) -> list[dict]:
+    if layout == "SINGLE":
+        return [{"name": f"{run}.fastq.gz", "bytes": None, "mate": 1, "source": "sra-converted"}]
+    return [{"name": f"{run}_{mate}.fastq.gz", "bytes": None, "mate": mate, "source": "sra-converted"}
+            for mate in (1, 2)]
+
+
+def download_run_aws(run: str, record: dict, run_dir: Path, files: list[dict], threads: int,
+                     connections: int, retries: int, network_wait: float, log, report=None) -> None:
+    """AWS SRA object -> multi-connection download -> fasterq-dump -> validated FASTQ.gz.
+
+    Raises aws_download.NotOnAws when the bucket has no such run (the caller falls back
+    to ENA). Network outages wait (up to network_wait each) without using attempts.
+    """
+    url = aws_download.aws_url(run)
+    sra = run_dir / f"{run}.sra"
+    read_count = str(record["row"].get("read_count", "")).strip()
+    expected_spots = int(read_count) if read_count.isdigit() and int(read_count) > 0 else None
+    attempts, outages = 0, 0
+
+    def say(text):
+        log_message(text, log)
+
+    while True:
+        try:
+            if network_wait > 0:
+                aws_download.wait_for_network(network_wait, say)
+            size = aws_download.remote_size(url)
+            say(f"{run}: AWS 下载 {size / 1024**3:.2f} GiB，{connections} 个连接。")
+            aws_download.parallel_download(url, sra, size, connections, report=report)
+            progress("download", current_sample=run, step="转换 FASTQ")
+            aws_download.convert_sra(sra, run_dir, run, record["library_layout"], threads, log,
+                                     expected_spots=expected_spots)
+            progress("download", current_sample=run, step="校验 FASTQ")
+            for item in files:
+                validate_fastq(run_dir / item["name"], item)
+            sra.unlink(missing_ok=True)
+            with (run_dir / "success.log").open("a", encoding="utf-8") as handle:
+                handle.write(f"aws-sra {run}\n")
+            return
+        except aws_download.NotOnAws:
+            raise
+        except aws_download.NetworkDown as exc:
+            outages += 1
+            if network_wait <= 0 or outages > 50:
+                raise RuntimeError(f"{run}: 下载中断：{exc}") from exc
+            say(f"{run}: {exc}；等待网络后续传。")
+            aws_download.wait_for_network(network_wait, say)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            if network_wait > 0 and not aws_download.network_ok():
+                outages += 1
+                if outages > 50:
+                    raise RuntimeError(f"{run}: 网络反复中断：{exc}") from exc
+                continue
+            attempts += 1
+            say(f"{run}: AWS 下载或转换失败（{attempts}/{retries}）：{exc}")
+            if attempts >= retries:
+                raise RuntimeError(f"{run}: {retries} 次 AWS 下载后仍未完成；已下载部分保留，可重试。{exc}") from exc
+            if isinstance(exc, ValueError):
+                # A complete but unusable archive is fetched again from scratch.
+                sra.unlink(missing_ok=True)
+                sra.with_name(sra.name + ".chunks.json").unlink(missing_ok=True)
+
+
 def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: Path,
             log_path: Path, iseq_bin="iseq", threads=8, retries=3, metadata_timeout=180,
-            output_space_multiplier=4, gsm="", runs=None) -> dict:
+            output_space_multiplier=4, gsm="", runs=None, download_source="ena",
+            connections=1, network_wait=0) -> dict:
     accession = normalize_accession(accession)
     runs = [normalize_accession(run) for run in (runs or [])]
     pooled = bool(runs)
@@ -673,6 +764,13 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
         raise ValueError(f"{accession}: Run 列表无效。")
     if threads < 1 or retries < 1 or metadata_timeout < 1:
         raise ValueError("下载线程数、重试次数和元数据超时必须大于零。")
+    if download_source not in DOWNLOAD_SOURCES:
+        raise ValueError(f"下载来源必须是 {'、'.join(sorted(DOWNLOAD_SOURCES))} 之一。")
+    connections, network_wait = int(connections), float(network_wait)
+    if connections < 1 or network_wait < 0:
+        raise ValueError("下载连接数必须大于零，网络等待时间不能为负。")
+    if (download_source == "aws" or network_wait > 0) and aws_download is None:
+        raise RuntimeError("找不到 aws_download 模块。")
     if not shutil.which(iseq_bin):
         raise RuntimeError(f"当前环境找不到 iSeq: {iseq_bin}")
     samples_dir, output_dir = Path(samples_dir).resolve(), Path(output_dir).resolve()
@@ -692,7 +790,8 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
             for run in runs:
                 run_raw = samples_dir / run
                 run_raw.mkdir(parents=True, exist_ok=True)
-                metadata, run_fields, run_records = obtain_metadata(run, run_raw, iseq_bin, metadata_timeout, log)
+                metadata, run_fields, run_records = with_network(
+                    lambda: obtain_metadata(run, run_raw, iseq_bin, metadata_timeout, log), network_wait, log)
                 if list(run_records) != [run]:
                     raise ValueError(f"{accession}/{run}: 元数据返回的 Run 与清单不一致：{list(run_records)[:5]}")
                 record = run_records[run]
@@ -707,10 +806,12 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
                 raise ValueError(f"{accession}: Run 的单双端类型不一致（{detail}），无法合并为一个样本。")
             write_geo_mapping(output_dir / "samples.tsv", mapping)
         elif geo:
-            metadata, fields, records, mapping = obtain_geo_metadata(accession, samples_dir, log)
+            metadata, fields, records, mapping = with_network(
+                lambda: obtain_geo_metadata(accession, samples_dir, log), network_wait, log)
             write_geo_mapping(output_dir / "samples.tsv", mapping)
         else:
-            metadata, fields, records = obtain_metadata(accession, samples_dir, iseq_bin, metadata_timeout, log)
+            metadata, fields, records = with_network(
+                lambda: obtain_metadata(accession, samples_dir, iseq_bin, metadata_timeout, log), network_wait, log)
         if not geo and not pooled:
             for run, record in records.items():
                 row = record["row"]
@@ -726,6 +827,10 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
             raw_dir = samples_dir / run if geo or pooled else samples_dir
             raw_dir.mkdir(parents=True, exist_ok=True)
             record["raw_dir"] = str(raw_dir)
+            if download_source == "aws":
+                # AWS objects are SRA archives; FASTQ names follow the conversion.
+                record["ena_files"] = record["files"]
+                record["files"] = converted_files(run, record["library_layout"])
         raw_bytes = check_space(samples_dir, output_dir, records, float(output_space_multiplier))
         single_runs = sum(record["library_layout"] == "SINGLE" for record in records.values())
         paired_runs = len(records) - single_runs
@@ -744,10 +849,28 @@ def prepare(accession: str, samples_dir: Path, output_dir: Path, manifest_path: 
             run_metadata = run_dir / f"{run}.metadata.tsv"
             if run_metadata != Path(record.get("metadata_path", metadata)):
                 write_metadata(run_metadata, record.get("fields", fields), [record["row"]])
+            status = "reused"
             already_complete = run in logged_runs(success_log) and pair_is_complete(run_dir, files)
+            if (not already_complete and record.get("ena_files") and run in logged_runs(success_log)
+                    and pair_is_complete(run_dir, record["ena_files"])):
+                files = record["files"] = record["ena_files"]  # finished earlier from ENA
+                already_complete = True
+            if not already_complete and download_source == "aws":
+                remove_success_marker(success_log, run)
+
+                def report(done, total, speed, run=run, index=index):
+                    progress("download", total_runs=len(records), downloaded_runs=index - 1, current_sample=run,
+                             step=f"AWS 下载 {done / total:.0%}（{speed / 1024**2:.2f} MB/s）")
+                try:
+                    download_run_aws(run, record, run_dir, files, threads, connections, retries,
+                                     network_wait, log, report)
+                    already_complete, status = True, "downloaded"
+                except aws_download.NotOnAws as exc:
+                    log_message(f"{exc}；改用 ENA。", log)
+                    files = record["files"] = record["ena_files"]
             if already_complete:
-                status = "reused"
-                log_message(f"Run {index}/{len(records)} {run}: 复用已完成 FASTQ。", log)
+                log_message(f"Run {index}/{len(records)} {run}: "
+                            f"{'复用已完成 FASTQ' if status == 'reused' else 'AWS 下载并转换完成'}。", log)
             else:
                 status, last_error = "downloaded", None
                 for attempt in range(1, retries + 1):
@@ -819,9 +942,13 @@ def run_preparation(*args, **kwargs):
 
 
 if "snakemake" in globals():
+    if aws_download is None:
+        sys.path.insert(0, snakemake.params.script_dir)
+        import aws_download
     run_preparation(snakemake.params.accession, Path(snakemake.params.samples_dir),
                     Path(snakemake.params.output_dir), Path(snakemake.output[0]), Path(snakemake.log[0]),
                     iseq_bin=snakemake.params.iseq_bin, threads=int(snakemake.threads),
                     retries=int(snakemake.params.retries), metadata_timeout=int(snakemake.params.metadata_timeout),
                     output_space_multiplier=float(snakemake.params.output_space_multiplier), gsm=snakemake.params.gsm,
-                    runs=list(snakemake.params.runs))
+                    runs=list(snakemake.params.runs), download_source=snakemake.params.download_source,
+                    connections=int(snakemake.params.connections), network_wait=float(snakemake.params.network_wait))

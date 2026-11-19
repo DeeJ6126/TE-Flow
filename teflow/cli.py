@@ -28,6 +28,28 @@ from .runtime import JobManager
 POLL_SECONDS = 1.0
 
 
+
+def _download_arguments(parser) -> None:
+    parser.add_argument("--source", dest="download_source", choices=("ena", "aws"),
+                        help="下载来源：ena（iSeq，默认）或 aws（NCBI SRA 的 AWS 公开地址，多连接下载后转换）")
+    parser.add_argument("--connections", dest="connections", type=_positive_integer,
+                        help="每个文件同时使用的下载连接数（aws），默认读取 settings.yaml 的 download_connections")
+    parser.add_argument("--downloads", dest="downloads", type=_non_negative_integer,
+                        help="下载与分析分开调度：最多同时下载的项目数；0 = 在项目内下载（默认）")
+    parser.add_argument("--wait-network", dest="network_wait", type=_non_negative_integer, metavar="MINUTES",
+                        help="网络中断时最多等待的分钟数，恢复后继续；0 = 不等待（默认）")
+
+
+def _non_negative_integer(raw: str) -> int:
+    try:
+        result = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须是非负整数") from exc
+    if result < 0:
+        raise argparse.ArgumentTypeError("必须是非负整数")
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tf", description="TE 工作流：GEO/SRA 到合并计数表；不带命令打开 TUI。")
     parser.add_argument("--settings", help="应用 settings.yaml 路径")
@@ -44,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
                      help="本批最多同时运行的项目数，默认读取 settings.yaml 的 max_parallel_jobs")
     run.add_argument("--verbose", "-v", action="store_true", help="显示详细工具日志")
     run.add_argument("--discard-reads", action="store_true", help="每个 Run 计数成功后清理原始及清洗后的 FASTQ 和 BAM")
+    _download_arguments(run)
     submit = commands.add_parser("submit", help="提交单个编号后立即返回（维护入口）")
     submit.add_argument("accession")
     submit.add_argument("-t", "--type", dest="data_type", choices=DATA_TYPES, required=True,
@@ -75,6 +98,8 @@ def shortcut_main(argv: Sequence[str] | None = None) -> int:
         prog="tf",
         description="TE 工作流快捷入口；不带参数打开 TUI。多个项目自动按共享资源并行。",
         epilog="示例：tf -a GSE219739 -t bulk；tf -f /root/selection.csv -t bulk --discard-reads -j 2 --threads 16；"
+               "边下载边分析：tf -f /root/selection.csv -t bulk --discard-reads -j 3 --threads 20 "
+               "--source aws --downloads 8 --connections 16 --wait-network 720；"
                "tf status [编号]；tf logs <编号>",
     )
     source_group = parser.add_mutually_exclusive_group()
@@ -89,11 +114,14 @@ def shortcut_main(argv: Sequence[str] | None = None) -> int:
                         help="本批最多同时运行的项目数，默认读取 settings.yaml 的 max_parallel_jobs")
     parser.add_argument("--verbose", "-v", action="store_true", help="显示详细工具日志")
     parser.add_argument("--discard-reads", action="store_true", help="每个 Run 计数成功后清理原始及清洗后的 FASTQ 和 BAM")
+    _download_arguments(parser)
     args = parser.parse_args(argv)
+    download_flags = {"--source": args.download_source, "--connections": args.connections,
+                      "--downloads": args.downloads, "--wait-network": args.network_wait}
     forwarded = [f"--settings={args.settings}"] if args.settings is not None else []
     if args.accession is None and args.file is None:
         if (args.cores is not None or args.parallel_jobs is not None or args.verbose or args.discard_reads
-                or args.data_type is not None):
+                or args.data_type is not None or any(v is not None for v in download_flags.values())):
             parser.error("请使用 -a 指定编号或 -f 指定 TXT；直接运行 tf 打开 TUI。")
         return main(forwarded)
     if args.data_type is None:
@@ -107,6 +135,9 @@ def shortcut_main(argv: Sequence[str] | None = None) -> int:
         forwarded.extend(["--jobs", str(args.parallel_jobs)])
     if args.discard_reads:
         forwarded.append("--discard-reads")
+    for flag, value in download_flags.items():
+        if value is not None:
+            forwarded.extend([flag, str(value)])
     if args.verbose:
         forwarded.append("--verbose")
     # An explicit positional boundary also preserves values beginning with '-'.
@@ -267,6 +298,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             extra = {"discard_reads": True} if args.discard_reads else {}
             if args.parallel_jobs is not None:
                 extra["parallel_jobs"] = args.parallel_jobs
+            for key in ("download_source", "connections", "downloads", "network_wait"):
+                if getattr(args, key) is not None:
+                    extra[key] = getattr(args, key)
             jobs = manager.submit_many(args.source, input_mode=args.input_mode, cores=args.cores,
                                        data_type=args.data_type, **extra)
             return watch_jobs(manager, jobs, verbose=args.verbose, console=console)
