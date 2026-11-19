@@ -189,7 +189,7 @@ tf -f /root/te_model_selection_run_order.csv -t bulk --discard-reads -j 3 --thre
 - 原始数据：/root/nfsdata/TEatlas/bulk_rna；结果：/root/nfsdata/TEatlas/bulk_rna_results（2.7 起；之前的结果在 /root/TEatlas/bulk_rna）
 - 参考：沿用模板指定的 STAR index、基因 GTF、TE GTF
 - 代理配置：/home/codex/server-213-setup/proxy.env
-- 调度记录：/root/teflow/state/jobs.json（紧凑 JSON）、scheduler.log。几千个任务时 `tf -f` 的实时查看器每秒读一次整份记录，全量提交建议不挂查看器（见交接文档）
+- 调度记录：/root/teflow/state/jobs.json（紧凑 JSON）、scheduler.log。几千个任务时 `tf -f` 的实时查看器每秒读一次整份记录，全量提交建议不挂查看器；用 `python setup/batch-summary.py [--rate 30]` 看一屏摘要
 - 旧版备份：/root/teflow-backups/20261014-v1.tar.gz
 
 **链方向**：每个样本比对后先运行 `infer_strandedness`，用最多 40 万条唯一比对的 reads 与基因 GTF 的 exon 方向比较（双端以 read1 为准），结果写入 `qc/<样本>.strandedness.json` 并传给 TEcount 的 `--stranded`：read1 与基因同向 ≥80% 为 forward，反向 ≥80% 为 reverse（dUTP / TruSeq Stranded 等），其余为 no（不分链；介于 60%–80% 时在 reason 中提示人工核对）。`settings.yaml` 的 `stranded` 默认 `auto`，也可固定为 `no`、`forward` 或 `reverse`。2.5 之前的结果使用 TEcount 默认的 `--stranded no`（服务器上 TEcount 帮助写明 DEFAULT: no），即按不分链计数；链特异性建库的旧结果若需要区分正义 / 反义 TE，需要重新计数。
