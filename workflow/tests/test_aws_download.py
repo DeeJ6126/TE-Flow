@@ -201,6 +201,24 @@ class PrepareAwsTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             prepare_samples.with_network(lambda: (_ for _ in ()).throw(FileNotFoundError("x")), 0, log)
 
+    def test_transient_run_set_mismatch_is_retried_then_raised(self):
+        attempts = []
+
+        def flaky():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise prepare_samples.RunSetMismatch("Run 查询返回了其他编号")
+            return "ok"
+        sleeps = []
+        with patch.object(aws_download, "network_ok", lambda probe=None: True):
+            self.assertEqual(prepare_samples.with_network(flaky, 600, io.StringIO(), sleep=sleeps.append), "ok")
+            self.assertEqual(sleeps, [30, 60])
+            with self.assertRaises(prepare_samples.RunSetMismatch):
+                prepare_samples.with_network(lambda: (_ for _ in ()).throw(prepare_samples.RunSetMismatch("x")),
+                                             600, io.StringIO(), sleep=lambda s: None)
+            with self.assertRaises(KeyError):  # unrelated errors are not retried
+                prepare_samples.with_network(lambda: {}["x"], 600, io.StringIO(), sleep=lambda s: None)
+
 
 if __name__ == "__main__":
     unittest.main()

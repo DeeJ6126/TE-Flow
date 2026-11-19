@@ -670,17 +670,34 @@ ENA_PROBE = "https://www.ebi.ac.uk/ena/portal/api/"
 DOWNLOAD_SOURCES = {"ena", "aws"}
 
 
-def with_network(action, network_wait: float, log, probe=ENA_PROBE, rounds=20):
-    """Run action; if it fails while the network is down, wait for it and try again.
+METADATA_TRIES = 3
+METADATA_RETRY_SECONDS = 30
 
+
+def with_network(action, network_wait: float, log, probe=ENA_PROBE, rounds=20, sleep=time.sleep):
+    """Run a metadata action robustly when network waiting is enabled (network_wait > 0).
+
+    - The network is down: wait for it (up to network_wait), then try again.
+    - The network works but the answer is incomplete or names other Runs (ENA timed out
+      and iSeq fell back to a broader NCBI search): try again after a pause, at most
+      METADATA_TRIES times; RunSetMismatch is still raised if it persists.
     With network_wait=0 (the default) errors propagate unchanged, as before 2.7.
     """
+    failures = 0
     for _ in range(rounds):
         try:
             return action()
         except Exception as exc:
-            if network_wait <= 0 or aws_download.network_ok(probe):
+            if network_wait <= 0:
                 raise
+            if aws_download.network_ok(probe):
+                failures += 1
+                if failures >= METADATA_TRIES or not isinstance(exc, (MetadataFormatError, FileNotFoundError)):
+                    raise
+                log_message(f"元数据不完整或范围不符（{exc}），{METADATA_RETRY_SECONDS * failures} 秒后重试"
+                            f"（{failures}/{METADATA_TRIES - 1}）。", log)
+                sleep(METADATA_RETRY_SECONDS * failures)
+                continue
             log_message(f"网络中断（{type(exc).__name__}: {exc}），等待恢复后重试。", log)
             progress("metadata", step="等待网络恢复")
             aws_download.wait_for_network(network_wait, lambda text: log_message(text, log), probe=probe)
